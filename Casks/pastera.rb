@@ -1,6 +1,6 @@
 cask "pastera" do
-  version "2.0.1-beta"
-  sha256 "29241ac8a2ec30c58a06cd217d9a769c1a34bcbcdde383363f7c6bfc391007f1"
+  version "3.0.3-beta"
+  sha256 "b8874a168a357394ea956dad58753a037776508b2831c6609dddae3412a94d58"
 
   url "https://github.com/pastera-app/Pastera/releases/download/v#{version}/Pastera-#{version}-macOS.dmg",
       verified: "github.com/pastera-app/Pastera/"
@@ -14,7 +14,7 @@ cask "pastera" do
     strategy :github_releases
   end
 
-  depends_on macos: ">= :ventura"
+  depends_on macos: ">= :sequoia"
 
   app "Pastera.app"
 
