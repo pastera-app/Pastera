@@ -613,6 +613,37 @@ struct PasteboardContentTests {
     }
 
     @Test
+    func oneDriveFolderSyncProviderPreservesHistoryWhenProtocolCannotBeRead() throws {
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let protocolURL = rootURL.appendingPathComponent("history/protocol.json")
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: protocolURL.path)
+            try? FileManager.default.removeItem(at: rootURL)
+        }
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        try provider.saveHistorySnapshot([
+            PasteboardHistorySyncPayload(
+                id: "remote-history", text: "Remote history", updateAt: 10,
+                deviceID: "remote-device", sourceKind: .plainText
+            )
+        ], deviceID: "remote-device", limit: 2000, maxTextBytes: 256 * 1024,
+           snapshotTextBudgetBytes: 8 * 1024 * 1024)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: protocolURL.path)
+
+        #expect(throws: (any Error).self) {
+            try provider.loadHistorySnapshots(excludingDeviceID: "local-device")
+        }
+        #expect(FileManager.default.fileExists(
+            atPath: rootURL.appendingPathComponent("history/devices/remote-device.sqlite").path
+        ))
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: protocolURL.path)
+        #expect(try provider.loadHistorySnapshots(excludingDeviceID: "local-device")
+            .first?.payloads.first?.id == "remote-history")
+    }
+
+    @Test
     func oneDriveFolderSyncProviderReportsHistorySnapshotFileStates() throws {
         let rootURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

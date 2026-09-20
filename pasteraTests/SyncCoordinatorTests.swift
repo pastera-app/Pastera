@@ -397,6 +397,92 @@ struct SyncCoordinatorTests {
     }
 
     @Test
+    func coordinatorClearsFailedStatusAfterSuccessfulAutomaticNoOp() throws {
+        let rootURL = try makeRootURL()
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        try provider.saveHistorySnapshot(
+            [], deviceID: "remote-device", limit: 2000,
+            maxTextBytes: 256 * 1024, snapshotTextBudgetBytes: 8 * 1024 * 1024
+        )
+        let devicesURL = rootURL.appendingPathComponent("history/devices", isDirectory: true)
+        try FileManager.default.removeItem(at: devicesURL)
+        try Data("Blocked history directory".utf8).write(to: devicesURL)
+        let coordinator = SyncCoordinator(
+            settingsProvider: { makeSettings(rootURL: rootURL, historyImport: true) },
+            providerFactory: { _ in provider },
+            historyRepository: historyRepository,
+            snippetRepository: snippetRepository
+        )
+
+        coordinator.syncNow(reason: .manual, wait: true)
+
+        #expect(coordinator.status.phase == .failed)
+        #expect(coordinator.status.errorDescription != nil)
+        try FileManager.default.removeItem(at: devicesURL)
+        try FileManager.default.createDirectory(at: devicesURL, withIntermediateDirectories: true)
+
+        coordinator.syncNow(reason: .timer, wait: true)
+
+        #expect(coordinator.status.phase == .succeeded)
+        #expect(coordinator.status.errorDescription == nil)
+        #expect(coordinator.status.importedCount == 0)
+        #expect(coordinator.status.uploadedCount == 0)
+    }
+
+    @Test
+    func coordinatorClearsSkippedStatusAfterSuccessfulAutomaticNoOp() throws {
+        let rootURL = try makeRootURL()
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        try FileManager.default.removeItem(at: rootURL)
+        let coordinator = SyncCoordinator(
+            settingsProvider: { makeSettings(rootURL: rootURL, historyImport: true) },
+            historyRepository: historyRepository,
+            snippetRepository: snippetRepository
+        )
+
+        coordinator.syncNow(reason: .manual, wait: true)
+
+        #expect(coordinator.status.phase == .skipped)
+        #expect(coordinator.status.errorDescription != nil)
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+
+        coordinator.syncNow(reason: .timer, wait: true)
+
+        #expect(coordinator.status.phase == .succeeded)
+        #expect(coordinator.status.errorDescription == nil)
+        #expect(coordinator.status.importedCount == 0)
+        #expect(coordinator.status.uploadedCount == 0)
+    }
+
+    @Test
+    func coordinatorClearsWarningAfterSuccessfulAutomaticNoOp() throws {
+        let rootURL = try makeRootURL()
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let remoteDirectoryURL = rootURL.appendingPathComponent("files/devices/remote-device", isDirectory: true)
+        try FileManager.default.createDirectory(at: remoteDirectoryURL, withIntermediateDirectories: true)
+        try Data("Incomplete manifest".utf8).write(to: remoteDirectoryURL.appendingPathComponent("manifest.json"))
+        let coordinator = SyncCoordinator(
+            settingsProvider: { makeSettings(rootURL: rootURL, fileImport: true) },
+            historyRepository: historyRepository,
+            snippetRepository: snippetRepository
+        )
+
+        coordinator.syncNow(reason: .manual, wait: true)
+
+        #expect(coordinator.status.phase == .succeeded)
+        #expect(coordinator.status.warningDescription != nil)
+        try FileManager.default.removeItem(at: remoteDirectoryURL)
+
+        coordinator.syncNow(reason: .timer, wait: true)
+
+        #expect(coordinator.status.phase == .succeeded)
+        #expect(coordinator.status.warningDescription == nil)
+        #expect(coordinator.status.importedCount == 0)
+        #expect(coordinator.status.uploadedCount == 0)
+    }
+
+    @Test
     func coordinatorSkipsUnchangedRemoteHistorySnapshotBeforeUpsert() throws {
         let rootURL = try makeRootURL()
         defer { try? FileManager.default.removeItem(at: rootURL) }
@@ -425,6 +511,96 @@ struct SyncCoordinatorTests {
         coordinator.syncNow(reason: .timer, wait: true)
 
         #expect(countingRepository.upsertedHistoryIDs.isEmpty)
+    }
+
+    @Test
+    func coordinatorPreservesRemoteHistoryWarningAfterUploadOnlyNoOp() throws {
+        let rootURL = try makeRootURL()
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        let coordinator = SyncCoordinator(
+            settingsProvider: { makeSettings(rootURL: rootURL, historyUpload: true, historyImport: true) },
+            providerFactory: { _ in provider },
+            historyRepository: historyRepository,
+            snippetRepository: snippetRepository
+        )
+        coordinator.syncNow(reason: .manual, wait: true)
+
+        let remoteID = PasteboardHistory.ID(rawValue: "pending-remote-history")
+        try provider.saveHistorySnapshot([
+            PasteboardHistorySyncPayload(
+                id: remoteID.rawValue, text: "Pending remote history", updateAt: 10,
+                deviceID: "remote-device", sourceKind: .plainText
+            )
+        ], deviceID: "remote-device", limit: 2000, maxTextBytes: 256 * 1024,
+           snapshotTextBudgetBytes: 8 * 1024 * 1024)
+        let snapshotURL = rootURL.appendingPathComponent("history/devices/remote-device.sqlite")
+        let validBytes = try Data(contentsOf: snapshotURL)
+        try Data(repeating: 0xFF, count: validBytes.count).write(to: snapshotURL)
+
+        coordinator.syncNow(reason: .timer, wait: true)
+
+        let warning = try #require(coordinator.status.warningDescription)
+        #expect(historyRepository.fetchHistory(id: remoteID) == nil)
+
+        coordinator.syncNow(reason: .localChange, wait: true)
+
+        #expect(coordinator.status.warningDescription == warning)
+        #expect(coordinator.status.uploadedCount == 0)
+        #expect(historyRepository.fetchHistory(id: remoteID) == nil)
+
+        try validBytes.write(to: snapshotURL)
+        coordinator.syncNow(reason: .timer, wait: true)
+
+        #expect(historyRepository.fetchHistory(id: remoteID)?.title == "Pending remote history")
+        #expect(coordinator.status.phase == .succeeded)
+        #expect(coordinator.status.warningDescription == nil)
+    }
+
+    @Test
+    func coordinatorRetriesRecoveredHistorySnapshotWithUnchangedFileState() throws {
+        let rootURL = try makeRootURL()
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        let remoteID = PasteboardHistory.ID(rawValue: "recovered-remote-history")
+        try provider.saveHistorySnapshot([
+            PasteboardHistorySyncPayload(
+                id: remoteID.rawValue,
+                text: "Recovered remote history",
+                updateAt: 10,
+                deviceID: "remote-device",
+                sourceKind: .plainText
+            )
+        ], deviceID: "remote-device", limit: 2000, maxTextBytes: 256 * 1024, snapshotTextBudgetBytes: 8 * 1024 * 1024)
+        let snapshotURL = rootURL.appendingPathComponent("history/devices/remote-device.sqlite")
+        let validBytes = try Data(contentsOf: snapshotURL)
+        let modificationDate = Date(timeIntervalSince1970: 1_700_000_000)
+        try Data(repeating: 0xFF, count: validBytes.count).write(to: snapshotURL)
+        try FileManager.default.setAttributes([.modificationDate: modificationDate], ofItemAtPath: snapshotURL.path)
+        let failedFileStates = try provider.historySnapshotFileStates(excludingDeviceID: currentDeviceID)
+        #expect(failedFileStates.count == 1)
+        let coordinator = SyncCoordinator(
+            settingsProvider: { makeSettings(rootURL: rootURL, historyImport: true) },
+            providerFactory: { _ in provider },
+            historyRepository: historyRepository,
+            snippetRepository: snippetRepository
+        )
+
+        coordinator.syncNow(reason: .manual, wait: true)
+
+        #expect(historyRepository.fetchHistory(id: remoteID) == nil)
+        #expect(coordinator.status.warningDescription != nil)
+        try validBytes.write(to: snapshotURL)
+        try FileManager.default.setAttributes([.modificationDate: modificationDate], ofItemAtPath: snapshotURL.path)
+        let recoveredFileStates = try provider.historySnapshotFileStates(excludingDeviceID: currentDeviceID)
+        #expect(recoveredFileStates == failedFileStates)
+
+        coordinator.syncNow(reason: .timer, wait: true)
+
+        #expect(historyRepository.fetchHistory(id: remoteID)?.title == "Recovered remote history")
+        #expect(coordinator.status.phase == .succeeded)
+        #expect(coordinator.status.importedCount == 1)
+        #expect(coordinator.status.warningDescription == nil)
     }
 
     @Test

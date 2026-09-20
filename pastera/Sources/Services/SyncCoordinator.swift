@@ -709,7 +709,10 @@ final class SyncCoordinator {
         do {
             let provider = providerFactory(rootURL)
             let result = try sync(settings: settings, provider: provider, directionPlan: directionPlan)
-            guard reason == .manual || !result.isNoOp else { return }
+            if reason != .manual, result.isNoOp {
+                guard reason != .localChange,
+                      status.phase != .succeeded || status.warningDescription != nil else { return }
+            }
             setStatus(SyncStatus(
                 phase: .succeeded,
                 lastSyncAt: Date(),
@@ -809,7 +812,11 @@ final class SyncCoordinator {
         var result = SyncRunResult()
 
         if directionPlan.importRemote, settings.historyImportEnabled {
-            result.imported += try importHistories(provider: provider)
+            let historyResult = try importHistories(provider: provider)
+            result.imported += historyResult.imported
+            if historyResult.unreadableCount > 0 {
+                result.warnings.append("有 \(historyResult.unreadableCount) 个历史快照暂未读取，将在下次同步重试")
+            }
         }
         if directionPlan.importRemote, settings.snippetImportEnabled {
             result.imported += try importSnippets(provider: provider)
@@ -845,21 +852,27 @@ final class SyncCoordinator {
         return result
     }
 
-    private func importHistories(provider: OneDriveFolderSyncProvider) throws -> Int {
+    private func importHistories(provider: OneDriveFolderSyncProvider) throws -> (imported: Int, unreadableCount: Int) {
         let states = try provider.historySnapshotFileStates(excludingDeviceID: currentDeviceID)
         let changedStates = states.filter {
             importedHistorySnapshotStates[$0.cacheKey] != $0
         }
-        guard !changedStates.isEmpty else { return 0 }
-        let payloads = try provider.loadHistorySnapshots(from: changedStates, excludingDeviceID: currentDeviceID)
-            .flatMap(\.payloads)
-        let imported = payloads.reduce(0) { importedCount, payload in
-            importedCount + (historyRepository.upsertSyncPayload(payload) ? 1 : 0)
-        }
+        var imported = 0
+        var unreadableCount = 0
         for state in changedStates {
+            guard let snapshot = try? provider.loadHistorySnapshot(at: state.url) else {
+                unreadableCount += 1
+                continue
+            }
+            if snapshot.deviceID != currentDeviceID {
+                for payload in snapshot.payloads {
+                    imported += historyRepository.upsertSyncPayload(payload) ? 1 : 0
+                }
+            }
+            // A cloud placeholder may become readable without changing its size or modification time.
             importedHistorySnapshotStates[state.cacheKey] = state
         }
-        return imported
+        return (imported, unreadableCount)
     }
 
     private func importSnippets(provider: OneDriveFolderSyncProvider) throws -> Int {

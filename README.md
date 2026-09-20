@@ -19,17 +19,16 @@ macOS 应用是当前可运行的产品基线。原生 Windows 客户端将在�
 
 ## 下载
 
-[下载当前 Beta](https://github.com/pastera-app/Pastera/releases/tag/v3.0.0-beta) 或 [查看全部 Releases](https://github.com/pastera-app/Pastera/releases)。
+[下载当前 Beta](https://github.com/pastera-app/Pastera/releases/tag/v3.0.3-beta) 或 [查看全部 Releases](https://github.com/pastera-app/Pastera/releases)。
 
-### 当前版本：3.0.0-beta
+### 当前版本：3.0.3-beta
 
-- 限制启动 OCR 回填的内存占用，避免一次载入大量图片历史。
-- 使用持久化实时 OCR 队列，降低后台任务的常驻资源占用。
-- 优化历史清理路径，并按需启停 OneDrive 文件监听。
-- 增加用户可感知的 OCR 延迟和处理状态反馈。
-- 修复非 Debug 配置下的 Release 构建问题。
+- 修复 OneDrive 历史快照暂时不可读后不再重试的问题，恢复后可继续导入其他设备的复制记录。
+- 同步恢复成功后刷新失败状态，并提示仍待重试的历史快照。
+- 读取云端协议文件失败时保留历史快照，避免将临时读取故障误判为旧协议并清理数据。
+- 密码箱支持通过数字键快捷粘贴密码和账户。
 
-系统要求：macOS 13 Ventura 或更高版本。
+系统要求：macOS 15 Sequoia 或更高版本。
 
 > [!WARNING]
 > 当前公开 DMG 使用 ad-hoc 签名，尚未经过 Apple 公证。首次打开若被 macOS 阻止，请前往“系统设置 > 隐私与安全性”，确认应用来源后选择“仍要打开”。

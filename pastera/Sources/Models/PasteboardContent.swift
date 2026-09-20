@@ -1038,7 +1038,7 @@ final class OneDriveFolderSyncProvider {
         return FileDeviceSyncLoadResult(snapshots: snapshots, skippedManifestCount: skippedManifestCount)
     }
 
-    private func loadHistorySnapshot(at url: URL) throws -> HistorySyncSnapshot {
+    func loadHistorySnapshot(at url: URL) throws -> HistorySyncSnapshot {
         let database = try SyncSQLiteDatabase(url: url)
         let metadata = try readMetadata(database: database)
         guard metadata["schemaVersion"] == "\(Self.historyProtocolVersion)" else {
@@ -1502,7 +1502,14 @@ final class OneDriveFolderSyncProvider {
     }
 
     private func ensureHistoryProtocol() throws {
-        if let data = try? Data(contentsOf: historyProtocolURL),
+        let data: Data?
+        do {
+            data = try Data(contentsOf: historyProtocolURL)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
+            data = nil
+        }
+        // Read failures are not evidence of an old protocol. Preserve remote snapshots for the next retry.
+        if let data,
            let manifest = try? JSONDecoder().decode(HistoryProtocolManifest.self, from: data),
            manifest.schemaVersion == Self.historyProtocolVersion {
             try fileManager.createDirectory(at: historyDevicesURL, withIntermediateDirectories: true)

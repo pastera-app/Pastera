@@ -149,6 +149,8 @@ the root-level `manifest.json`, `histories/*.json`, or
 development: if `history/protocol.json` is missing, corrupt, or not
 `schemaVersion=4`, Pastera deletes and rebuilds only the `history` domain.
 The `files` domain is left intact.
+An I/O error while reading an existing protocol file is reported as a sync
+failure and leaves the history domain intact so the next sync can retry.
 
 Each app installation uses a persistent app-level device UUID. macOS seeds that
 value from the machine UUID on first use when available, then stores it in
@@ -306,6 +308,11 @@ Before opening a remote history SQLite file, Pastera compares its file size and
 modification time against the last successfully processed state for that app
 run. Unchanged remote snapshots are skipped without opening SQLite or running
 row-level import checks.
+Only successfully read snapshots enter that cache. Unreadable snapshots remain
+eligible for the next sync even when their size and modification time stay the
+same; an import pass reports a warning for snapshots it cannot read. A successful
+automatic import pass clears an earlier failure or warning even if it imports
+no new rows.
 
 ## Sync Switches
 
