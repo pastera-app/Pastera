@@ -7,7 +7,7 @@
         <language>zh-Hans</language>
         <item>
             <title>Pastera 3.0.3</title>
-            <link>https://github.com/pastera-app/Pastera/releases/tag/v3.0.3-beta</link>
+            <link>https://github.com/pastera-app/Pastera/releases/download/v3.0.3-beta/Pastera-3.0.3-beta-macOS.dmg</link>
             <sparkle:releaseNotesLink>https://github.com/pastera-app/Pastera/releases/tag/v3.0.3-beta</sparkle:releaseNotesLink>
             <pubDate>Sun, 20 Sep 2026 09:07:53 +0000</pubDate>
             <sparkle:version>303</sparkle:version>

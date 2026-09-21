@@ -87,10 +87,23 @@ struct SparkleUpdateFeedTests {
         #expect(item.elements(forName: "sparkle:minimumSystemVersion").first?.stringValue == "15.0")
         #expect(item.elements(forName: "sparkle:informationalUpdate").first != nil)
         #expect(item.elements(forName: "enclosure").isEmpty)
-        #expect(
+        let infoURLString = try #require(
             item.elements(forName: "link").first?.stringValue
+        )
+        let infoURL = try #require(URL(string: infoURLString))
+        #expect(
+            infoURL.absoluteString
+                == "https://github.com/pastera-app/Pastera/releases/download/v\(shortVersion)-beta/Pastera-\(shortVersion)-beta-macOS.dmg"
+        )
+        #expect(
+            item.elements(forName: "sparkle:releaseNotesLink").first?.stringValue
                 == "https://github.com/pastera-app/Pastera/releases/tag/v\(shortVersion)-beta"
         )
+        // Legacy clients hand this informational URL to Sparkle's browser action,
+        // avoiding the anonymous Release API that their in-app downloader requires.
+        #expect(throws: PasteraManualUpdateError.invalidReleaseMetadata) {
+            try PasteraManualUpdateAssetResolver.releaseAPIURL(for: infoURL)
+        }
     }
 
     @Test
