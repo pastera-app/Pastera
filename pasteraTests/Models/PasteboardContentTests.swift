@@ -567,7 +567,7 @@ struct PasteboardContentTests {
     }
 
     @Test
-    func oneDriveFolderSyncProviderReinitializesOldHistoryProtocolWithoutRemovingFilesDomain() throws {
+    func oneDriveFolderSyncProviderUpgradesOldHistoryProtocolWithoutRemovingRemoteSnapshots() throws {
         let rootURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: rootURL) }
@@ -576,7 +576,7 @@ struct PasteboardContentTests {
         let filesDirectory = rootURL.appendingPathComponent("files/devices/device-a", isDirectory: true)
         try FileManager.default.createDirectory(at: oldHistoryDirectory, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: filesDirectory, withIntermediateDirectories: true)
-        try Data("{\"schemaVersion\":3}".utf8)
+        try Data("{\"schemaVersion\":3,\"generatedAt\":1}".utf8)
             .write(to: rootURL.appendingPathComponent("history/protocol.json"))
         try Data("old sqlite".utf8)
             .write(to: oldHistoryDirectory.appendingPathComponent("old-device.sqlite"))
@@ -601,9 +601,11 @@ struct PasteboardContentTests {
         let protocolData = try Data(contentsOf: rootURL.appendingPathComponent("history/protocol.json"))
         #expect(protocolData.range(of: Data("\"schemaVersion\"".utf8)) != nil)
         #expect(protocolData.range(of: Data("4".utf8)) != nil)
-        #expect(!FileManager.default.fileExists(
-            atPath: oldHistoryDirectory.appendingPathComponent("old-device.sqlite").path
-        ))
+        #expect(try Data(contentsOf: oldHistoryDirectory.appendingPathComponent("old-device.sqlite"))
+            == Data("old sqlite".utf8))
+        #expect(try provider.loadHistorySnapshots(excludingDeviceID: "device-a").isEmpty)
+        #expect(try provider.loadHistorySnapshots(excludingDeviceID: "another-device")
+            .flatMap(\.payloads).map(\.id) == ["history-1"])
         #expect(FileManager.default.fileExists(
             atPath: rootURL.appendingPathComponent("history/devices/device-a.sqlite").path
         ))
@@ -612,8 +614,65 @@ struct PasteboardContentTests {
         ))
     }
 
+    @Test(arguments: ["missing", "empty", "malformed"], ["states", "snapshots", "save"])
+    func historySnapshotsSurviveIncompleteSharedProtocol(protocolState: String, entryPoint: String) throws {
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        let remotePayload = PasteboardHistorySyncPayload(
+            id: "arrived-before-protocol", text: "Remote text", updateAt: 10,
+            deviceID: "remote-device", sourceKind: .plainText
+        )
+        try provider.saveHistorySnapshot(
+            [remotePayload], deviceID: "remote-device", limit: 10,
+            maxTextBytes: 1024, snapshotTextBudgetBytes: 4096
+        )
+        let remoteURL = rootURL.appendingPathComponent("history/devices/remote-device.sqlite")
+        let remoteData = try Data(contentsOf: remoteURL)
+        let remoteModifiedAt = try FileManager.default.attributesOfItem(atPath: remoteURL.path)[.modificationDate] as? Date
+        let protocolURL = rootURL.appendingPathComponent("history/protocol.json")
+        let incompleteProtocol: Data?
+        switch protocolState {
+        case "missing":
+            incompleteProtocol = nil
+            try FileManager.default.removeItem(at: protocolURL)
+        case "empty":
+            incompleteProtocol = Data()
+            try Data().write(to: protocolURL)
+        default:
+            incompleteProtocol = Data("{\"schemaVersion\":".utf8)
+            try incompleteProtocol?.write(to: protocolURL)
+        }
+
+        if entryPoint == "states" {
+            #expect(try provider.historySnapshotFileStates(excludingDeviceID: "local-device")
+                .map(\.url.lastPathComponent) == ["remote-device.sqlite"])
+        } else if entryPoint == "snapshots" {
+            #expect(try provider.loadHistorySnapshots(excludingDeviceID: "local-device")
+                .flatMap(\.payloads) == [remotePayload])
+        }
+        if entryPoint != "save" {
+            #expect((try? Data(contentsOf: protocolURL)) == incompleteProtocol)
+            #expect((try? Data(contentsOf: remoteURL)) == remoteData)
+        }
+
+        try provider.saveHistorySnapshot(
+            [PasteboardHistorySyncPayload(
+                id: "local-history", text: "Local text", updateAt: 20,
+                deviceID: "local-device", sourceKind: .plainText
+            )], deviceID: "local-device", limit: 10,
+            maxTextBytes: 1024, snapshotTextBudgetBytes: 4096
+        )
+
+        #expect((try? Data(contentsOf: remoteURL)) == remoteData)
+        #expect(try FileManager.default.attributesOfItem(atPath: remoteURL.path)[.modificationDate] as? Date == remoteModifiedAt)
+        #expect(try provider.loadHistorySnapshots(excludingDeviceID: "local-device")
+            .flatMap(\.payloads) == [remotePayload])
+    }
+
     @Test
-    func oneDriveFolderSyncProviderPreservesHistoryWhenProtocolCannotBeRead() throws {
+    func oneDriveFolderSyncProviderReadsHistoryWithoutProtocolPermissionAndPreservesItOnSaveFailure() throws {
         let rootURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         let protocolURL = rootURL.appendingPathComponent("history/protocol.json")
@@ -631,8 +690,13 @@ struct PasteboardContentTests {
            snapshotTextBudgetBytes: 8 * 1024 * 1024)
         try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: protocolURL.path)
 
+        #expect(try provider.loadHistorySnapshots(excludingDeviceID: "local-device")
+            .first?.payloads.first?.id == "remote-history")
         #expect(throws: (any Error).self) {
-            try provider.loadHistorySnapshots(excludingDeviceID: "local-device")
+            try provider.saveHistorySnapshot(
+                [], deviceID: "local-device", limit: 10,
+                maxTextBytes: 1024, snapshotTextBudgetBytes: 4096
+            )
         }
         #expect(FileManager.default.fileExists(
             atPath: rootURL.appendingPathComponent("history/devices/remote-device.sqlite").path
@@ -641,6 +705,38 @@ struct PasteboardContentTests {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: protocolURL.path)
         #expect(try provider.loadHistorySnapshots(excludingDeviceID: "local-device")
             .first?.payloads.first?.id == "remote-history")
+    }
+
+    @Test
+    func oneDriveFolderSyncProviderRejectsFutureProtocolWithoutOverwritingSharedHistory() throws {
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        try provider.saveHistorySnapshot(
+            [PasteboardHistorySyncPayload(
+                id: "remote-history", text: "Remote text", updateAt: 10,
+                deviceID: "remote-device", sourceKind: .plainText
+            )], deviceID: "remote-device", limit: 10,
+            maxTextBytes: 1024, snapshotTextBudgetBytes: 4096
+        )
+        let protocolURL = rootURL.appendingPathComponent("history/protocol.json")
+        let futureProtocol = Data("{\"schemaVersion\":99,\"generatedAt\":1}".utf8)
+        try futureProtocol.write(to: protocolURL)
+        let remoteURL = rootURL.appendingPathComponent("history/devices/remote-device.sqlite")
+        let remoteData = try Data(contentsOf: remoteURL)
+
+        #expect(throws: (any Error).self) {
+            try provider.saveHistorySnapshot(
+                [], deviceID: "local-device", limit: 10,
+                maxTextBytes: 1024, snapshotTextBudgetBytes: 4096
+            )
+        }
+
+        #expect((try? Data(contentsOf: protocolURL)) == futureProtocol)
+        #expect((try? Data(contentsOf: remoteURL)) == remoteData)
+        #expect(!FileManager.default.fileExists(atPath:
+            rootURL.appendingPathComponent("history/devices/local-device.sqlite").path))
     }
 
     @Test
@@ -673,8 +769,8 @@ struct PasteboardContentTests {
         #expect(state.modifiedAtNanoseconds > 0)
     }
 
-    @Test
-    func oneDriveFolderSyncProviderSkipsV2HistorySnapshots() throws {
+    @Test(arguments: ["2", "3"])
+    func oneDriveFolderSyncProviderSkipsOldHistorySnapshotsWithoutRemovingThem(schemaVersion: String) throws {
         let rootURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: rootURL) }
@@ -691,13 +787,15 @@ struct PasteboardContentTests {
         }
         sqlite3_exec(handle, """
             CREATE TABLE metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
-            INSERT INTO metadata(key, value) VALUES ('schemaVersion', '2'), ('deviceID', 'remote-device');
+            INSERT INTO metadata(key, value) VALUES ('schemaVersion', '\(schemaVersion)'), ('deviceID', 'remote-device');
             CREATE TABLE histories (id TEXT PRIMARY KEY NOT NULL, updatedAt INTEGER NOT NULL, title TEXT NOT NULL);
             """, nil, nil, nil)
         sqlite3_close(handle)
         handle = nil
+        let oldSnapshotData = try Data(contentsOf: sqliteURL)
 
         #expect(try provider.loadHistorySnapshots(excludingDeviceID: "device-a").isEmpty)
+        #expect((try? Data(contentsOf: sqliteURL)) == oldSnapshotData)
     }
 
     @Test
@@ -1196,12 +1294,14 @@ private func makeNoisyImage(width: Int, height: Int) throws -> NSImage {
         bytesPerRow: 0,
         bitsPerPixel: 0
     ))
+    let bitmapData = try #require(bitmap.bitmapData)
     for row in 0..<height {
         for column in 0..<width {
-            let red = CGFloat((column * 37 + row * 17) % 256) / 255
-            let green = CGFloat((column * 11 + row * 53) % 256) / 255
-            let blue = CGFloat((column * 23 + row * 29) % 256) / 255
-            bitmap.setColor(NSColor(red: red, green: green, blue: blue, alpha: 1), atX: column, y: row)
+            let index = row * bitmap.bytesPerRow + column * 4
+            bitmapData[index] = UInt8((column * 37 + row * 17) % 256)
+            bitmapData[index + 1] = UInt8((column * 11 + row * 53) % 256)
+            bitmapData[index + 2] = UInt8((column * 23 + row * 29) % 256)
+            bitmapData[index + 3] = 255
         }
     }
     let image = NSImage(size: NSSize(width: width, height: height))

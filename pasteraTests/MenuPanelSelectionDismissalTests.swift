@@ -21,6 +21,8 @@ import Testing
 struct MenuPanelSelectionDismissalTests {
     @Test
     func selectingHistoryItemDismissesMainMenuPanel() throws {
+        AppEnvironment.push(clipboardScriptCoordinator: ScriptRowCoordinator(hasScripts: false))
+        defer { _ = AppEnvironment.popLast() }
         let historyID = PasteboardHistory.ID("history-1")
         let history = PasteboardHistory(
             id: historyID,
@@ -90,6 +92,8 @@ struct MenuPanelSelectionDismissalTests {
 
     @Test
     func historyPanelInheritsMainMenuPasteTargetContext() throws {
+        AppEnvironment.push(clipboardScriptCoordinator: ScriptRowCoordinator(hasScripts: false))
+        defer { _ = AppEnvironment.popLast() }
         let history = PasteboardHistory(
             id: PasteboardHistory.ID("history-1"),
             title: "First History",
@@ -122,6 +126,8 @@ struct MenuPanelSelectionDismissalTests {
 
     @Test
     func selectingHistoryItemSchedulesSelectionAfterPanelDismissal() throws {
+        AppEnvironment.push(clipboardScriptCoordinator: ScriptRowCoordinator(hasScripts: false))
+        defer { _ = AppEnvironment.popLast() }
         let history = PasteboardHistory(
             id: PasteboardHistory.ID("history-1"),
             title: "First History",

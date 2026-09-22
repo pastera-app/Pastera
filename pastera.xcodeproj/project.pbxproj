@@ -142,6 +142,7 @@
 		C5F3000C2FF3000000B7C0DE /* PasswordVaultEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5F3000D2FF3000000B7C0DE /* PasswordVaultEditorView.swift */; };
 		C5D2A1062FEA130000B7C0DE /* MainMenuVisualPolishTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5D2A1072FEA130000B7C0DE /* MainMenuVisualPolishTests.swift */; };
 		C5D2A1082FEA140000B7C0DE /* HistoryMenuPreviewInteractionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5D2A1092FEA140000B7C0DE /* HistoryMenuPreviewInteractionTests.swift */; };
+		C50907012FEA140000B7C0DE /* MenuHistoryScriptLoadingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C50907022FEA140000B7C0DE /* MenuHistoryScriptLoadingTests.swift */; };
 		C5A920002FD230000B7C0DE /* OpacityPreferenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5A920012FD230000B7C0DE /* OpacityPreferenceTests.swift */; };
 		C5B100002FD750000B7C0DE /* InstallationLocationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5B100012FD750000B7C0DE /* InstallationLocationService.swift */; };
 		C5B100032FD750000B7C0DE /* InstallationLocationServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5B100022FD750000B7C0DE /* InstallationLocationServiceTests.swift */; };
@@ -440,6 +441,7 @@
 		C5F3000D2FF3000000B7C0DE /* PasswordVaultEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PasswordVaultEditorView.swift; sourceTree = "<group>"; };
 		C5D2A1072FEA130000B7C0DE /* MainMenuVisualPolishTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainMenuVisualPolishTests.swift; sourceTree = "<group>"; };
 		C5D2A1092FEA140000B7C0DE /* HistoryMenuPreviewInteractionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HistoryMenuPreviewInteractionTests.swift; sourceTree = "<group>"; };
+		C50907022FEA140000B7C0DE /* MenuHistoryScriptLoadingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuHistoryScriptLoadingTests.swift; sourceTree = "<group>"; };
 		C5A920012FD230000B7C0DE /* OpacityPreferenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpacityPreferenceTests.swift; sourceTree = "<group>"; };
 		C5B100012FD750000B7C0DE /* InstallationLocationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstallationLocationService.swift; sourceTree = "<group>"; };
 		C5B100022FD750000B7C0DE /* InstallationLocationServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstallationLocationServiceTests.swift; sourceTree = "<group>"; };
@@ -1125,6 +1127,7 @@
 				D9108BB4C8104B1380B3AB02 /* PasswordVaultNumberShortcutTests.swift */,
 				C5D2A1072FEA130000B7C0DE /* MainMenuVisualPolishTests.swift */,
 				C5D2A1092FEA140000B7C0DE /* HistoryMenuPreviewInteractionTests.swift */,
+				C50907022FEA140000B7C0DE /* MenuHistoryScriptLoadingTests.swift */,
 				C5A920012FD230000B7C0DE /* OpacityPreferenceTests.swift */,
 				C5B100022FD750000B7C0DE /* InstallationLocationServiceTests.swift */,
 				C5B100042FD750000B7C0DE /* ReleasePackagingConfigurationTests.swift */,
@@ -1791,6 +1794,7 @@
 					D9108BB4C8104B1380B3AB01 /* PasswordVaultNumberShortcutTests.swift in Sources */,
 						C5D2A1062FEA130000B7C0DE /* MainMenuVisualPolishTests.swift in Sources */,
 						C5D2A1082FEA140000B7C0DE /* HistoryMenuPreviewInteractionTests.swift in Sources */,
+						C50907012FEA140000B7C0DE /* MenuHistoryScriptLoadingTests.swift in Sources */,
 						C5A920002FD230000B7C0DE /* OpacityPreferenceTests.swift in Sources */,
 				C5B100032FD750000B7C0DE /* InstallationLocationServiceTests.swift in Sources */,
 				C5B100052FD750000B7C0DE /* ReleasePackagingConfigurationTests.swift in Sources */,

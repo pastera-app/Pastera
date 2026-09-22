@@ -439,6 +439,8 @@ struct SnippetBrowserPanelTests {
         startsAtZero: Bool,
         operation: () throws -> Void
     ) rethrows {
+        AppEnvironment.push(clipboardScriptCoordinator: ScriptRowCoordinator(hasScripts: false))
+        defer { _ = AppEnvironment.popLast() }
         let defaults = AppEnvironment.current.defaults
         let shortcutKey = Constants.UserDefaults.addNumericKeyEquivalents
         let startKey = Constants.UserDefaults.menuItemsTitleStartWithZero
@@ -541,6 +543,8 @@ extension SnippetBrowserPanelTests {
 
     @Test
     func deletingHistoryDoesNotReloadVisiblePanelBeforeRepositoryChange() throws {
+        AppEnvironment.push(clipboardScriptCoordinator: ScriptRowCoordinator(hasScripts: false))
+        defer { _ = AppEnvironment.popLast() }
         let historyID = PasteboardHistory.ID("history-delete-no-reload")
         let detail = PasteboardHistoryDetail(
             history: PasteboardHistory(

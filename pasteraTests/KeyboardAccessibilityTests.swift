@@ -118,6 +118,46 @@ extension KeyboardAccessibilityTests {
 
 }
 
+extension KeyboardAccessibilityTests {
+    @Test
+    func pasteCommandSendsBalancedCommandTransitionsForRemoteKeyForwarding() throws {
+        var events = [CGEvent]()
+        var locations = [CGEventTapLocation]()
+        PasteService.postPasteCommand { event, location in
+            events.append(event)
+            locations.append(location)
+        }
+
+        // Remote key forwarders track modifiers through flagsChanged, rather
+        // than interpreting the modifier flags attached to a V key event.
+        var commandIsDown = false
+        var commandWasDownForKeyDown = [Bool]()
+        for event in events {
+            if event.type == .flagsChanged,
+               event.getIntegerValueField(.keyboardEventKeycode) == 55 {
+                commandIsDown = event.flags.contains(.maskCommand)
+            } else if event.type == .keyDown {
+                commandWasDownForKeyDown.append(commandIsDown)
+            }
+        }
+        #expect(commandWasDownForKeyDown == [true])
+        #expect(!commandIsDown, "Command must be released after pasting")
+        #expect(events.map(\.type) == [.flagsChanged, .keyDown, .keyUp, .flagsChanged])
+        #expect(locations.allSatisfy { $0 == .cgAnnotatedSessionEventTap })
+
+        try #require(events.count == 4)
+        #expect(events[0].getIntegerValueField(.keyboardEventKeycode) == 55)
+        #expect(events[3].getIntegerValueField(.keyboardEventKeycode) == 55)
+        #expect(events[1].getIntegerValueField(.keyboardEventKeycode) ==
+                events[2].getIntegerValueField(.keyboardEventKeycode))
+        #expect(events[0].flags == .maskCommand)
+        #expect(events[1].flags == .maskCommand)
+        #expect(events[2].flags == .maskCommand)
+        #expect(events[3].flags.isEmpty)
+    }
+
+}
+
 @MainActor
 @Suite(.serialized)
 struct KeyboardAccessibilityTests {

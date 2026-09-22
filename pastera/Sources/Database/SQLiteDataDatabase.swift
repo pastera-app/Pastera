@@ -49,7 +49,8 @@ extension DependencyValues {
         configuration.prepareDatabase {
             switch context {
             case .live, .preview:
-                $0.trace { print($0.expandedDescription) }
+                // Expanding bound values formats entire clipboard text and image blobs.
+                $0.trace { print($0.description) }
             case .test:
                 break
             }

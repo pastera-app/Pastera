@@ -145,12 +145,14 @@ ordinary files under the device's `assets` directory.
 
 The old development protocol is not read. Pastera no longer reads
 the root-level `manifest.json`, `histories/*.json`, or
-`snippets/items|folders/*.json`. History sync is not backward-compatible during
-development: if `history/protocol.json` is missing, corrupt, or not
-`schemaVersion=4`, Pastera deletes and rebuilds only the `history` domain.
-The `files` domain is left intact.
-An I/O error while reading an existing protocol file is reported as a sync
-failure and leaves the history domain intact so the next sync can retry.
+`snippets/items|folders/*.json`. Each history SQLite snapshot is validated against
+`schemaVersion=4`; older snapshots are skipped and preserved. Reading history
+does not initialize or rewrite the shared directory or `history/protocol.json`.
+This lets snapshots arrive before the protocol marker without losing data.
+Writing initializes or upgrades the marker without deleting other devices'
+snapshots, including when the marker is missing or incomplete. An unreadable
+marker or a recognized future protocol version prevents the write and preserves
+the shared files for retry or a newer app version.
 
 Each app installation uses a persistent app-level device UUID. macOS seeds that
 value from the machine UUID on first use when available, then stores it in
@@ -308,11 +310,31 @@ Before opening a remote history SQLite file, Pastera compares its file size and
 modification time against the last successfully processed state for that app
 run. Unchanged remote snapshots are skipped without opening SQLite or running
 row-level import checks.
-Only successfully read snapshots enter that cache. Unreadable snapshots remain
+Only snapshots whose rows were successfully processed enter that cache. A local
+database write failure is reported as a failure and leaves the snapshot eligible
+for retry. Unreadable snapshots remain
 eligible for the next sync even when their size and modification time stay the
 same; an import pass reports a warning for snapshots it cannot read. A successful
 automatic import pass clears an earlier failure or warning even if it imports
 no new rows.
+
+While an import scope is enabled, Pastera watches the sync folder for remote
+history/snippet snapshots and file manifests/assets. Events are coalesced for
+about half a second before an import pass; the default 300-second timer remains
+a fallback. This removes the polling delay after OneDrive delivers a file, but
+does not control OneDrive's cloud transfer time. File assets arriving after their
+manifest trigger another import attempt. The watcher ignores this device's own
+files and hidden temporary files, and stops when sync is stopped or reconfigured.
+An event-triggered pass imports enabled scopes without directly exporting data
+or triggering password vault synchronization.
+
+When the existing overwrite-duplicate-history preference is enabled, history
+lists group plain text and RTF/HTML variants only when their complete plain text
+bytes match. Grouping happens after filters and before pagination, with the most
+recent matching record representing the group. Original records and formats
+remain stored. Explicitly deleting a displayed group removes its matching
+members and suppresses each ID locally so sync cannot immediately restore them.
+Images, files, and multi-item text payloads retain their separate paste behavior.
 
 ## Sync Switches
 
@@ -320,8 +342,8 @@ The Sync pane separates automatic work into two main switches:
 
 - `自动上传`: startup, timer, and local-change passes may write this device's
   history/snippet snapshots to OneDrive.
-- `自动同步`: startup and timer passes may import snapshots written by other
-  devices.
+- `自动同步`: startup, timer, and remote file-change passes may import snapshots
+  written by other devices.
 
 Four detailed scope switches control text history and snippets:
 

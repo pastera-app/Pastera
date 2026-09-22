@@ -217,7 +217,10 @@ struct HistoryDisplayContentTests {
         let suiteName = "HistoryDisplayContentTests.\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suiteName))
         defaults.removePersistentDomain(forName: suiteName)
-        AppEnvironment.push(defaults: defaults)
+        AppEnvironment.push(
+            clipboardScriptCoordinator: ScriptRowCoordinator(hasScripts: false),
+            defaults: defaults
+        )
         defer {
             _ = AppEnvironment.popLast()
             defaults.removePersistentDomain(forName: suiteName)

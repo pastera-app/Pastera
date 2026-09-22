@@ -11,6 +11,7 @@
 //
 
 import Combine
+import CoreServices
 import FileProvider
 import Foundation
 
@@ -449,6 +450,7 @@ final class SyncCoordinator {
         let pollInterval: TimeInterval
         let historyObservationEnabled: Bool
         let snippetObservationEnabled: Bool
+        let remoteObservationEnabled: Bool
         let hasEnabledWork: Bool
         let vaultSyncEnabled: Bool
     }
@@ -456,6 +458,7 @@ final class SyncCoordinator {
         case startup
         case timer
         case localChange
+        case remoteChange
         case manual
     }
 
@@ -474,6 +477,9 @@ final class SyncCoordinator {
     private let queue: DispatchQueue
     private let queueKey = DispatchSpecificKey<Void>()
     private var timer: DispatchSourceTimer?
+    private var remoteFolderObservation: SyncRemoteFolderObservation?
+    private var remoteObservationID: UUID?
+    private var pendingRemoteImport: DispatchWorkItem?
     private var historyObservation: AnyCancellable?
     private var snippetObservation: AnyCancellable?
     private var configurationObservation: AnyCancellable?
@@ -553,6 +559,7 @@ final class SyncCoordinator {
     }
 
     private func stopOnQueue() {
+        stopRemoteFolderObservation()
         timer?.cancel()
         timer = nil
         historyObservation = nil
@@ -595,11 +602,16 @@ final class SyncCoordinator {
             historyObservationEnabled: genericSyncEnabled
                 && (settings.historyUploadEnabled || settings.fileUploadEnabled),
             snippetObservationEnabled: genericSyncEnabled && settings.snippetUploadEnabled,
+            remoteObservationEnabled: genericSyncEnabled && settings.hasEnabledImportWork,
             hasEnabledWork: genericSyncEnabled,
             vaultSyncEnabled: vaultSyncEnabled
         )
         guard signature != activationSignature else { return }
         activationSignature = signature
+        stopRemoteFolderObservation()
+        if signature.remoteObservationEnabled, let rootURL = settings.rootURL {
+            observeRemoteFolder(rootURL: rootURL)
+        }
         guard genericSyncEnabled || vaultSyncEnabled else {
             timer?.cancel()
             timer = nil
@@ -645,6 +657,34 @@ final class SyncCoordinator {
         self.timer = timer
     }
 
+    private func stopRemoteFolderObservation() {
+        remoteObservationID = nil
+        pendingRemoteImport?.cancel()
+        pendingRemoteImport = nil
+        remoteFolderObservation = nil
+    }
+
+    private func observeRemoteFolder(rootURL: URL) {
+        let observationID = UUID()
+        remoteObservationID = observationID
+        remoteFolderObservation = SyncRemoteFolderObservation(
+            rootURL: rootURL,
+            deviceID: currentDeviceID,
+            queue: queue
+        ) { [weak self] in
+            guard let self, self.isStarted, self.remoteObservationID == observationID,
+                  self.pendingRemoteImport == nil else { return }
+            // Bound the delay even while a cloud download keeps producing events.
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.isStarted, self.remoteObservationID == observationID else { return }
+                self.pendingRemoteImport = nil
+                self.performSync(reason: .remoteChange)
+            }
+            self.pendingRemoteImport = work
+            self.queue.asyncAfter(deadline: .now() + 0.3, execute: work)
+        }
+    }
+
     private func observeLocalChanges(settings: SyncSettings, enabled: Bool) {
         historyObservation = nil
         if enabled, settings.historyUploadEnabled || settings.fileUploadEnabled {
@@ -667,6 +707,10 @@ final class SyncCoordinator {
     }
 
     private func performSync(reason: Reason) {
+        if reason == .remoteChange {
+            performGenericSync(reason: reason, vaultSyncEnabled: false)
+            return
+        }
         let vaultSyncEnabled = synchronizePasswordVaultIfEnabled(reason: reason)
         performGenericSync(reason: reason, vaultSyncEnabled: vaultSyncEnabled)
     }
@@ -874,7 +918,7 @@ final class SyncCoordinator {
             }
             if snapshot.deviceID != currentDeviceID {
                 for payload in snapshot.payloads {
-                    imported += historyRepository.upsertSyncPayload(payload) ? 1 : 0
+                    imported += try historyRepository.upsertSyncPayload(payload) ? 1 : 0
                 }
             }
             // A cloud placeholder may become readable without changing its size or modification time.
@@ -1003,9 +1047,100 @@ final class SyncCoordinator {
 
     private func directionPlan(reason: Reason, settings: SyncSettings) -> DirectionPlan {
         DirectionPlan(
-            upload: settings.hasEnabledUploadWork,
+            upload: reason != .remoteChange && settings.hasEnabledUploadWork,
             importRemote: reason == .localChange ? false : settings.hasEnabledImportWork
         )
+    }
+}
+
+private final class SyncRemoteFolderObservation {
+    private let stream: FSEventStreamRef
+
+    init?(rootURL: URL, deviceID: String, queue: DispatchQueue, onChange: @escaping () -> Void) {
+        let rootURL = rootURL.resolvingSymlinksInPath().standardizedFileURL
+        let callback = Callback(rootPath: rootURL.path, deviceID: deviceID, onChange: onChange)
+        var context = FSEventStreamContext(
+            version: 0,
+            info: Unmanaged.passUnretained(callback).toOpaque(),
+            retain: { info in
+                guard let info else { return nil }
+                _ = Unmanaged<Callback>.fromOpaque(info).retain()
+                return info
+            },
+            release: { info in
+                guard let info else { return }
+                Unmanaged<Callback>.fromOpaque(info).release()
+            },
+            copyDescription: nil
+        )
+        // Watching the parent also catches replacement/recreation of the sync root itself.
+        let paths = [rootURL.deletingLastPathComponent().path] as CFArray
+        let flags = FSEventStreamCreateFlags(
+            kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagFileEvents
+                | kFSEventStreamCreateFlagNoDefer | kFSEventStreamCreateFlagWatchRoot
+        )
+        let createdStream = withExtendedLifetime(callback) {
+            FSEventStreamCreate(nil, { _, info, count, eventPaths, eventFlags, _ in
+                guard let info else { return }
+                let callback = Unmanaged<Callback>.fromOpaque(info).takeUnretainedValue()
+                let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] ?? []
+                for index in 0..<min(count, paths.count) {
+                    if callback.shouldImport(path: paths[index], flags: eventFlags[index]) {
+                        callback.onChange()
+                        return
+                    }
+                }
+            }, &context, paths, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.2, flags)
+        }
+        guard let createdStream else { return nil }
+        FSEventStreamSetDispatchQueue(createdStream, queue)
+        guard FSEventStreamStart(createdStream) else {
+            FSEventStreamInvalidate(createdStream)
+            FSEventStreamRelease(createdStream)
+            return nil
+        }
+        stream = createdStream
+    }
+
+    deinit {
+        FSEventStreamStop(stream)
+        FSEventStreamInvalidate(stream)
+        FSEventStreamRelease(stream)
+    }
+
+    private final class Callback {
+        let rootPath: String
+        let deviceComponent: String
+        let onChange: () -> Void
+
+        init(rootPath: String, deviceID: String, onChange: @escaping () -> Void) {
+            self.rootPath = rootPath
+            let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.")
+            deviceComponent = String(deviceID.unicodeScalars.map { allowed.contains($0) ? Character($0) : "-" })
+                .trimmingCharacters(in: CharacterSet(charactersIn: ".-"))
+            self.onChange = onChange
+        }
+
+        func shouldImport(path: String, flags: FSEventStreamEventFlags) -> Bool {
+            let path = URL(fileURLWithPath: path).standardizedFileURL.path
+            let mustRescan = flags & FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs) != 0
+            if path == rootPath || (mustRescan && rootPath.hasPrefix(path + "/")) { return true }
+            guard path.hasPrefix(rootPath + "/") else { return false }
+            let components = path.dropFirst(rootPath.count + 1).split(separator: "/").map(String.init)
+            guard let domain = components.first, ["history", "snippets", "files"].contains(domain),
+                  !components.contains(where: { $0.hasPrefix(".") }) else { return false }
+            if components.count == 1 { return true }
+            guard components[1] == "devices" else { return false }
+            if components.count == 2 { return true }
+            if domain == "files" {
+                guard components[2] != deviceComponent else { return false }
+                return components.count == 3
+                    || (components.count == 4 && components[3] == "manifest.json")
+                    || (components.count >= 4 && components[3] == "assets")
+            }
+            return components.count == 3 && components[2].hasSuffix(".sqlite")
+                && components[2] != deviceComponent + ".sqlite"
+        }
     }
 }
 

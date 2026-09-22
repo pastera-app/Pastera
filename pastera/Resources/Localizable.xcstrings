@@ -10,6 +10,18 @@
     "View Release Notes" : { "localizations" : {
       "en" : { "stringUnit" : { "state" : "translated", "value" : "View Release Notes" } }, "de" : { "stringUnit" : { "state" : "translated", "value" : "Versionshinweise anzeigen" } }, "it" : { "stringUnit" : { "state" : "translated", "value" : "Visualizza note di rilascio" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "リリースノートを表示" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "查看版本说明" } }
     } },
+    "Download and install this update, then restart Pastera." : { "localizations" : {
+      "en" : { "stringUnit" : { "state" : "translated", "value" : "Download and install this update, then restart Pastera." } }, "de" : { "stringUnit" : { "state" : "translated", "value" : "Lade dieses Update, installiere es und starte Pastera anschließend neu." } }, "it" : { "stringUnit" : { "state" : "translated", "value" : "Scarica e installa questo aggiornamento, quindi riavvia Pastera." } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "アップデートをダウンロードしてインストールし、Pastera を再起動します。" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "下载并安装更新，然后重新启动 Pastera。" } }
+    } },
+    "The update has been downloaded and is ready to install." : { "localizations" : {
+      "en" : { "stringUnit" : { "state" : "translated", "value" : "The update has been downloaded and is ready to install." } }, "de" : { "stringUnit" : { "state" : "translated", "value" : "Das Update wurde geladen und kann installiert werden." } }, "it" : { "stringUnit" : { "state" : "translated", "value" : "L'aggiornamento è stato scaricato ed è pronto per l'installazione." } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "アップデートのダウンロードが完了し、インストールの準備ができました。" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "更新已下载，已准备好安装。" } }
+    } },
+    "The update is ready. Update now to restart Pastera, or install it when Pastera quits." : { "localizations" : {
+      "en" : { "stringUnit" : { "state" : "translated", "value" : "The update is ready. Update now to restart Pastera, or install it when Pastera quits." } }, "de" : { "stringUnit" : { "state" : "translated", "value" : "Das Update ist bereit. Aktualisiere jetzt, um Pastera neu zu starten, oder installiere es beim Beenden von Pastera." } }, "it" : { "stringUnit" : { "state" : "translated", "value" : "L'aggiornamento è pronto. Aggiorna ora per riavviare Pastera oppure installalo alla chiusura di Pastera." } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "アップデートの準備ができました。今すぐ更新して Pastera を再起動するか、Pastera の終了時にインストールできます。" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "更新已准备就绪。点击“更新”将重新启动 Pastera，或在退出 Pastera 时安装。" } }
+    } },
+    "Install on Quit" : { "localizations" : {
+      "en" : { "stringUnit" : { "state" : "translated", "value" : "Install on Quit" } }, "de" : { "stringUnit" : { "state" : "translated", "value" : "Beim Beenden installieren" } }, "it" : { "stringUnit" : { "state" : "translated", "value" : "Installa all'uscita" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "終了時にインストール" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "退出时安装" } }
+    } },
     "Download the verified disk image here, then finish installation in Finder." : { "localizations" : {
       "en" : { "stringUnit" : { "state" : "translated", "value" : "Download the verified disk image here, then finish installation in Finder." } }, "de" : { "stringUnit" : { "state" : "translated", "value" : "Lade das geprüfte Image hier und schließe die Installation im Finder ab." } }, "it" : { "stringUnit" : { "state" : "translated", "value" : "Scarica qui l'immagine verificata, quindi completa l'installazione nel Finder." } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "検証済みのディスクイメージをダウンロードし、Finder でインストールを完了します。" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "在应用内下载并校验磁盘映像，然后在访达中完成安装。" } }
     } },
@@ -594,6 +606,22 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "自动检查更新"
+          }
+        }
+      }
+    },
+    "Automatically download and install updates in the future" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatically download and install updates in the future"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "以后自动下载并安装更新"
           }
         }
       }

@@ -843,7 +843,36 @@ private extension VaultAgentBrokerTests {
         #expect(throws: VaultAgentPasteTargetError.self) { try tracker.resolve() }
     }
 
-    @Test("paste tracker keeps only the latest activation when inspections finish in reverse order")
+    @Test("paste target signature inspection does not block activation delivery or the main queue")
+    func pasteTargetInspectionDoesNotBlockActivation() throws {
+        let harness = PasteTargetHarness()
+        let tracker = harness.makeTracker()
+        let inspectionStarted = DispatchSemaphore(value: 0)
+        let releaseInspection = DispatchSemaphore(value: 0)
+        let activationReturned = DispatchSemaphore(value: 0)
+        let mainQueueResponsive = DispatchSemaphore(value: 0)
+        harness.prepare(pid: 42, bundleID: "com.example.editor", path: harness.targetURL)
+        harness.signatureWillRun = { _ in
+            inspectionStarted.signal()
+            _ = releaseInspection.wait(timeout: .now() + 3)
+        }
+        tracker.start()
+        defer {
+            releaseInspection.signal()
+            tracker.stop()
+        }
+
+        DispatchQueue.main.async {
+            harness.notifyActivation(pid: 42)
+            activationReturned.signal()
+        }
+        try #require(inspectionStarted.wait(timeout: .now() + 1) == .success)
+        #expect(activationReturned.wait(timeout: .now() + 0.2) == .success)
+        DispatchQueue.main.async { mainQueueResponsive.signal() }
+        #expect(mainQueueResponsive.wait(timeout: .now() + 0.2) == .success)
+    }
+
+    @Test("paste tracker keeps only the latest activation when an earlier inspection is in flight")
     func pasteTargetLatestActivationWins() throws {
         let harness = PasteTargetHarness()
         let tracker = harness.makeTracker()
@@ -871,8 +900,46 @@ private extension VaultAgentBrokerTests {
         harness.notifyActivation(pid: 44)
         releaseFirst.signal()
         #expect(firstFinished.wait(timeout: .now() + 1) == .success)
+        harness.waitForActivations()
 
         #expect(try tracker.resolve().processIdentifier == 44)
+    }
+
+    @Test("queued paste target inspections skip superseded activations and stopped tracking", arguments: [false, true])
+    func pasteTargetSkipsObsoleteQueuedInspections(stopBeforeProcessing: Bool) throws {
+        let harness = PasteTargetHarness()
+        let tracker = harness.makeTracker()
+        let releaseWorker = DispatchSemaphore(value: 0)
+        let obsoleteInspections = RuntimeLockedInt()
+        let latestInspections = RuntimeLockedInt()
+        harness.prepare(pid: 42, bundleID: "com.example.first", path: harness.targetURL)
+        harness.prepare(pid: 44, bundleID: "com.example.second", path: harness.secondTargetURL)
+        harness.snapshotWillRun = { pid in
+            if pid == 42 { obsoleteInspections.increment() }
+            if pid == 44 { latestInspections.increment() }
+        }
+        harness.activationWorker.async {
+            _ = releaseWorker.wait(timeout: .now() + 3)
+        }
+        tracker.start()
+        defer {
+            releaseWorker.signal()
+            tracker.stop()
+        }
+
+        harness.notifyActivation(pid: 42)
+        harness.notifyActivation(pid: 44)
+        if stopBeforeProcessing { tracker.stop() }
+        releaseWorker.signal()
+        harness.waitForActivations()
+
+        #expect(obsoleteInspections.value == 0)
+        #expect(latestInspections.value == (stopBeforeProcessing ? 0 : 1))
+        if stopBeforeProcessing {
+            #expect(throws: VaultAgentPasteTargetError.self) { try tracker.resolve() }
+        } else {
+            #expect(try tracker.resolve().processIdentifier == 44)
+        }
     }
 
     @Test("paste tracker stop invalidates an inspection already in flight")
@@ -899,6 +966,7 @@ private extension VaultAgentBrokerTests {
         tracker.stop()
         releaseInspection.signal()
         #expect(inspectionFinished.wait(timeout: .now() + 1) == .success)
+        harness.waitForActivations()
 
         #expect(throws: VaultAgentPasteTargetError.self) { try tracker.resolve() }
     }
@@ -915,6 +983,7 @@ private extension VaultAgentBrokerTests {
         harness.prepare(pid: 44, bundleID: "com.example.second", path: harness.secondTargetURL)
         harness.snapshots[44] = nil
         harness.notifyActivation(pid: 44)
+        harness.waitForActivations()
 
         #expect(throws: VaultAgentPasteTargetError.self) { try tracker.resolve() }
     }
@@ -2413,6 +2482,7 @@ private extension VaultAgentHostIntegrationStatus {
 
 private final class PasteTargetHarness {
     let notificationCenter = NotificationCenter()
+    let activationWorker = DispatchQueue(label: "com.pastera.test.paste-target")
     let helperURL = URL(fileURLWithPath: "/Applications/Pastera.app/Contents/Helpers/PasteraCodexMCP")
     let hostURL = URL(fileURLWithPath: "/Applications/Codex.app/Contents/MacOS/Codex")
     let targetURL = URL(fileURLWithPath: "/Applications/Editor.app/Contents/MacOS/Editor")
@@ -2428,6 +2498,7 @@ private final class PasteTargetHarness {
     var signatures: [String: VaultAgentCodeSignature] = [:]
     var focusedElements: [pid_t: AXUIElement] = [:]
     var snapshotWillRun: ((pid_t) -> Void)?
+    var signatureWillRun: ((URL) -> Void)?
 
     func makeTracker() -> VaultAgentPasteTargetTracker {
         VaultAgentPasteTargetTracker(
@@ -2447,10 +2518,12 @@ private final class PasteTargetHarness {
                 return snapshot
             },
             codeSigningInspector: PasteTargetSigningInspector { [weak self] url in
+                self?.signatureWillRun?(url)
                 guard let signature = self?.signatures[url.path] else { throw SocketTestError.rejected }
                 return signature
             },
-            focusedElement: { [weak self] pid in self?.focusedElements[pid] }
+            focusedElement: { [weak self] pid in self?.focusedElements[pid] },
+            activationWorker: activationWorker
         )
     }
 
@@ -2462,6 +2535,11 @@ private final class PasteTargetHarness {
     ) {
         prepare(pid: pid, bundleID: bundleID, path: path, focus: focus)
         notifyActivation(pid: pid)
+        waitForActivations()
+    }
+
+    func waitForActivations() {
+        activationWorker.sync {}
     }
 
     func prepare(

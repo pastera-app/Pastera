@@ -642,6 +642,7 @@ enum SyncSQLiteError: LocalizedError {
     case prepareFailed(String)
     case stepFailed(String)
     case missingMetadata(String)
+    case unsupportedHistoryProtocol(Int)
 
     var errorDescription: String? {
         switch self {
@@ -655,6 +656,8 @@ enum SyncSQLiteError: LocalizedError {
             return "无法读取同步数据库：\(message)"
         case .missingMetadata(let key):
             return "同步数据库缺少元数据：\(key)"
+        case .unsupportedHistoryProtocol(let version):
+            return "历史同步协议版本 \(version) 高于当前支持版本，请更新 Pastera 后重试"
         }
     }
 }
@@ -667,7 +670,7 @@ final class OneDriveFolderSyncProvider {
 
     private struct HistoryProtocolManifest: Codable {
         let schemaVersion: Int
-        let generatedAt: Int
+        let generatedAt: Int?
     }
 
     private struct FileDirectoryManifest: Codable {
@@ -714,8 +717,8 @@ final class OneDriveFolderSyncProvider {
         maxTextBytes: Int,
         snapshotTextBudgetBytes: Int
     ) throws {
-        try removeLegacyV1Paths()
         try ensureHistoryProtocol()
+        try removeLegacyV1Paths()
         let destinationURL = historyDevicesURL.appendingPathComponent(fileName(for: deviceID))
         let sortedPayloads = Array(payloads
             .sorted {
@@ -770,7 +773,6 @@ final class OneDriveFolderSyncProvider {
     }
 
     func loadHistorySnapshots(excludingDeviceID deviceID: String) throws -> [HistorySyncSnapshot] {
-        try ensureHistoryProtocol()
         return try loadHistorySnapshots(
             from: historySnapshotFileStates(excludingDeviceID: deviceID),
             excludingDeviceID: deviceID
@@ -795,7 +797,6 @@ final class OneDriveFolderSyncProvider {
     }
 
     func historySnapshotFileStates(excludingDeviceID deviceID: String) throws -> [HistoryRemoteSnapshotState] {
-        try ensureHistoryProtocol()
         let excludedFileName = fileName(for: deviceID)
         return try loadSQLiteFiles(in: historyDevicesURL).compactMap { url in
             guard url.lastPathComponent != excludedFileName,
@@ -1510,15 +1511,17 @@ final class OneDriveFolderSyncProvider {
         }
         // Read failures are not evidence of an old protocol. Preserve remote snapshots for the next retry.
         if let data,
-           let manifest = try? JSONDecoder().decode(HistoryProtocolManifest.self, from: data),
-           manifest.schemaVersion == Self.historyProtocolVersion {
-            try fileManager.createDirectory(at: historyDevicesURL, withIntermediateDirectories: true)
-            return
+           let manifest = try? JSONDecoder().decode(HistoryProtocolManifest.self, from: data) {
+            guard manifest.schemaVersion <= Self.historyProtocolVersion else {
+                throw SyncSQLiteError.unsupportedHistoryProtocol(manifest.schemaVersion)
+            }
+            if manifest.schemaVersion == Self.historyProtocolVersion {
+                try fileManager.createDirectory(at: historyDevicesURL, withIntermediateDirectories: true)
+                return
+            }
         }
 
-        if fileManager.fileExists(atPath: historyRootURL.path) {
-            try fileManager.removeItem(at: historyRootURL)
-        }
+        // OneDrive may deliver device snapshots before this shared marker. Never reset their directory.
         try fileManager.createDirectory(at: historyDevicesURL, withIntermediateDirectories: true)
         let manifest = HistoryProtocolManifest(
             schemaVersion: Self.historyProtocolVersion,

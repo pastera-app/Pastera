@@ -12,8 +12,10 @@
 
 import AppKit
 import Combine
+import Dependencies
 import DependenciesTestSupport
 import Foundation
+import SQLiteData
 import Testing
 @testable import Pastera
 
@@ -483,6 +485,218 @@ struct SyncCoordinatorTests {
     }
 
     @Test
+    func coordinatorImportsAtomicRemoteReplacementBeforePollingWithoutUploading() async throws {
+        let importedHistory = CountingHistoryRepository()
+        let rootURL = try makeRootURL()
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        let remoteID = PasteboardHistory.ID(rawValue: "watched-remote-history")
+        try writeWatchedRemoteHistory(provider: provider, id: remoteID, text: "Before replacement", updatedAt: 10)
+        let coordinatorQueue = DispatchQueue(label: "Pastera.SyncCoordinatorTests.remoteReplacement")
+        let vaultSync = CoordinatorPasswordVaultSyncController(snapshot: makeVaultSnapshot(mode: .localOnly))
+        let processStatus = CoordinatorOneDriveProcessStatusService()
+        let coordinator = SyncCoordinator(
+            settingsProvider: {
+                makeSettings(rootURL: rootURL, historyImport: true, snippetUpload: true)
+            },
+            providerFactory: { _ in provider },
+            historyRepository: importedHistory,
+            snippetRepository: SyncSnippetRepository(),
+            passwordVaultSyncServiceProvider: { vaultSync },
+            oneDriveProcessStatusServiceProvider: { processStatus },
+            queue: coordinatorQueue
+        )
+        coordinator.start()
+        defer { coordinator.stop() }
+        coordinatorQueue.sync {}
+        try #require(importedHistory.payload(id: remoteID.rawValue)?.text == "Before replacement")
+        let snippetURL = rootURL.appendingPathComponent("snippets/devices/\(currentDeviceID).sqlite")
+        let uploadedAt = try #require(FileManager.default
+            .attributesOfItem(atPath: snippetURL.path)[.modificationDate] as? Date)
+
+        try writeWatchedRemoteHistory(provider: provider, id: remoteID, text: "After replacement", updatedAt: 20)
+
+        let imported = try await waitForHistory(in: importedHistory, id: remoteID, text: "After replacement")
+        #expect(imported, "A downloaded remote snapshot must import without waiting for the 300-second timer")
+        #expect(try FileManager.default.attributesOfItem(atPath: snippetURL.path)[.modificationDate] as? Date == uploadedAt)
+    }
+
+    @Test
+    func coordinatorImportsRemoteFileWhenItsAssetArrivesAfterTheManifest() async throws {
+        let importedHistory = CountingHistoryRepository()
+        let rootURL = try makeRootURL()
+        let templateURL = try makeRootURL()
+        defer {
+            try? FileManager.default.removeItem(at: rootURL)
+            try? FileManager.default.removeItem(at: templateURL)
+        }
+        let remoteID = "late-remote-file"
+        let assetData = Data("%PDF-late-remote-file".utf8)
+        let template = OneDriveFolderSyncProvider(rootURL: templateURL)
+        try template.saveFileSnapshot(.init(histories: [
+            .init(deviceID: "remote-device", historyID: remoteID, updatedAt: 10, assets: [
+                .init(assetIndex: 0, pasteboardType: .pdf, data: assetData, originalFilename: "late.pdf")
+            ])
+        ], skippedAssetCount: 0), deviceID: "remote-device")
+        let templateDeviceURL = templateURL.appendingPathComponent("files/devices/remote-device")
+        let manifestData = try Data(contentsOf: templateDeviceURL.appendingPathComponent("manifest.json"))
+        let manifest = try #require(JSONSerialization.jsonObject(with: manifestData) as? [String: Any])
+        let histories = try #require(manifest["histories"] as? [[String: Any]])
+        let assets = try #require(histories.first?["assets"] as? [[String: Any]])
+        let relativePath = try #require(assets.first?["relativePath"] as? String)
+        let watchedDeviceURL = rootURL.appendingPathComponent("files/devices/remote-device")
+        let watchedAssetURL = watchedDeviceURL.appendingPathComponent(relativePath)
+        // Create parent directories before watching, so only the late blob produces the second event.
+        try FileManager.default.createDirectory(
+            at: watchedAssetURL.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let coordinatorQueue = DispatchQueue(label: "Pastera.SyncCoordinatorTests.lateFileAsset")
+        let vaultSync = CoordinatorPasswordVaultSyncController(snapshot: makeVaultSnapshot(mode: .localOnly))
+        let processStatus = CoordinatorOneDriveProcessStatusService()
+        let coordinator = SyncCoordinator(
+            settingsProvider: { makeSettings(rootURL: rootURL, fileImport: true) },
+            historyRepository: importedHistory,
+            snippetRepository: SyncSnippetRepository(),
+            passwordVaultSyncServiceProvider: { vaultSync },
+            oneDriveProcessStatusServiceProvider: { processStatus },
+            queue: coordinatorQueue
+        )
+        coordinator.start()
+        defer { coordinator.stop() }
+        coordinatorQueue.sync {}
+        try manifestData.write(to: watchedDeviceURL.appendingPathComponent("manifest.json"), options: .atomic)
+
+        let warningDeadline = Date().addingTimeInterval(5)
+        while Date() < warningDeadline,
+              !coordinatorQueue.sync(execute: { coordinator.status.warningDescription != nil }) {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try #require(coordinatorQueue.sync { coordinator.status.warningDescription != nil })
+        #expect(importedHistory.filePayload(id: remoteID) == nil)
+
+        try FileManager.default.copyItem(
+            at: templateDeviceURL.appendingPathComponent(relativePath), to: watchedAssetURL
+        )
+        let importDeadline = Date().addingTimeInterval(5)
+        while Date() < importDeadline, importedHistory.filePayload(id: remoteID) == nil {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+
+        let imported = try #require(
+            importedHistory.filePayload(id: remoteID),
+            "A late asset must trigger import without waiting for the 300-second polling timer"
+        )
+        #expect(imported.assets.first?.data == assetData)
+        #expect(imported.assets.first?.pasteboardType == .pdf)
+    }
+
+    @Test
+    func coordinatorDoesNotUploadAgainAfterItsOwnSnapshotReplacement() async throws {
+        let importedHistory = CountingHistoryRepository()
+        let rootURL = try makeRootURL()
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let coordinatorQueue = DispatchQueue(label: "Pastera.SyncCoordinatorTests.ownReplacement")
+        let vaultSync = CoordinatorPasswordVaultSyncController(snapshot: makeVaultSnapshot(mode: .localOnly))
+        let processStatus = CoordinatorOneDriveProcessStatusService()
+        let coordinator = SyncCoordinator(
+            settingsProvider: {
+                makeSettings(rootURL: rootURL, historyImport: true, snippetUpload: true, snippetImport: true)
+            },
+            historyRepository: importedHistory,
+            snippetRepository: SyncSnippetRepository(),
+            passwordVaultSyncServiceProvider: { vaultSync },
+            oneDriveProcessStatusServiceProvider: { processStatus },
+            queue: coordinatorQueue
+        )
+        coordinator.start()
+        defer { coordinator.stop() }
+        coordinatorQueue.sync {}
+        coordinator.syncNow(reason: .localChange, wait: true)
+        let snippetURL = rootURL.appendingPathComponent("snippets/devices/\(currentDeviceID).sqlite")
+        let uploadedAt = try #require(FileManager.default
+            .attributesOfItem(atPath: snippetURL.path)[.modificationDate] as? Date)
+
+        try await Task.sleep(for: .seconds(3))
+        coordinatorQueue.sync {}
+
+        #expect(try FileManager.default.attributesOfItem(atPath: snippetURL.path)[.modificationDate] as? Date == uploadedAt)
+    }
+
+    @Test(arguments: [false, true])
+    func coordinatorImportsFirstRemoteSnapshotAfterStartingWithEmptyRoot(recreateRoot: Bool) async throws {
+        let importedHistory = CountingHistoryRepository()
+        let containerURL = try makeRootURL()
+        defer { try? FileManager.default.removeItem(at: containerURL) }
+        let rootURL = containerURL.appendingPathComponent("sync", isDirectory: true)
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        #expect(!FileManager.default.fileExists(atPath: rootURL.appendingPathComponent("history/devices").path))
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        let coordinatorQueue = DispatchQueue(label: "Pastera.SyncCoordinatorTests.newRemoteDirectories")
+        let vaultSync = CoordinatorPasswordVaultSyncController(snapshot: makeVaultSnapshot(mode: .localOnly))
+        let processStatus = CoordinatorOneDriveProcessStatusService()
+        let coordinator = SyncCoordinator(
+            settingsProvider: { makeSettings(rootURL: rootURL, historyImport: true) },
+            providerFactory: { _ in provider },
+            historyRepository: importedHistory,
+            snippetRepository: SyncSnippetRepository(),
+            passwordVaultSyncServiceProvider: { vaultSync },
+            oneDriveProcessStatusServiceProvider: { processStatus },
+            queue: coordinatorQueue
+        )
+        coordinator.start()
+        defer { coordinator.stop() }
+        coordinatorQueue.sync {}
+        #expect(importedHistory.upsertedHistoryIDs.isEmpty)
+
+        if recreateRoot {
+            try FileManager.default.moveItem(
+                at: rootURL, to: containerURL.appendingPathComponent("previous-sync", isDirectory: true)
+            )
+            try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        }
+        let remoteID = PasteboardHistory.ID(rawValue: "first-remote-history")
+        try writeWatchedRemoteHistory(provider: provider, id: remoteID, text: "First remote snapshot", updatedAt: 10)
+
+        let imported = try await waitForHistory(in: importedHistory, id: remoteID, text: "First remote snapshot")
+        #expect(imported, "The root watcher must follow new directories and replacement of the sync root")
+    }
+
+    @Test
+    func coordinatorStopsImportingRemoteSnapshotChangesAfterStop() async throws {
+        let importedHistory = CountingHistoryRepository()
+        let rootURL = try makeRootURL()
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        let remoteID = PasteboardHistory.ID(rawValue: "stopped-remote-history")
+        try writeWatchedRemoteHistory(provider: provider, id: remoteID, text: "Before watching", updatedAt: 10)
+        let coordinatorQueue = DispatchQueue(label: "Pastera.SyncCoordinatorTests.stopWatching")
+        let vaultSync = CoordinatorPasswordVaultSyncController(snapshot: makeVaultSnapshot(mode: .localOnly))
+        let processStatus = CoordinatorOneDriveProcessStatusService()
+        let coordinator = SyncCoordinator(
+            settingsProvider: { makeSettings(rootURL: rootURL, historyImport: true) },
+            providerFactory: { _ in provider },
+            historyRepository: importedHistory,
+            snippetRepository: SyncSnippetRepository(),
+            passwordVaultSyncServiceProvider: { vaultSync },
+            oneDriveProcessStatusServiceProvider: { processStatus },
+            queue: coordinatorQueue
+        )
+        coordinator.start()
+        defer { coordinator.stop() }
+        coordinatorQueue.sync {}
+        try writeWatchedRemoteHistory(provider: provider, id: remoteID, text: "While watching", updatedAt: 20)
+        let imported = try await waitForHistory(in: importedHistory, id: remoteID, text: "While watching")
+        try #require(imported)
+
+        coordinator.stop()
+        try writeWatchedRemoteHistory(provider: provider, id: remoteID, text: "After stopping", updatedAt: 30)
+        try await Task.sleep(for: .seconds(3))
+        coordinatorQueue.sync {}
+
+        #expect(importedHistory.payload(id: remoteID.rawValue)?.text == "While watching")
+    }
+
+    @Test
     func coordinatorSkipsUnchangedRemoteHistorySnapshotBeforeUpsert() throws {
         let rootURL = try makeRootURL()
         defer { try? FileManager.default.removeItem(at: rootURL) }
@@ -601,6 +815,51 @@ struct SyncCoordinatorTests {
         #expect(coordinator.status.phase == .succeeded)
         #expect(coordinator.status.importedCount == 1)
         #expect(coordinator.status.warningDescription == nil)
+    }
+
+    @Test
+    func coordinatorRetriesUnchangedRemoteSnapshotAfterDatabaseWriteFailure() throws {
+        let rootURL = try makeRootURL()
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        let remoteID = PasteboardHistory.ID(rawValue: "retry-after-write-failure")
+        try provider.saveHistorySnapshot([
+            PasteboardHistorySyncPayload(
+                id: remoteID.rawValue, text: "Retry this import", updateAt: 10,
+                deviceID: "remote-device", sourceKind: .plainText
+            )
+        ], deviceID: "remote-device", limit: 2000, maxTextBytes: 256 * 1024,
+           snapshotTextBudgetBytes: 8 * 1024 * 1024)
+        let originalStates = try provider.historySnapshotFileStates(excludingDeviceID: currentDeviceID)
+        let coordinator = SyncCoordinator(
+            settingsProvider: { makeSettings(rootURL: rootURL, historyImport: true) },
+            providerFactory: { _ in provider },
+            historyRepository: historyRepository,
+            snippetRepository: snippetRepository
+        )
+        @Dependency(\.defaultDatabase) var database
+        try database.write { database in
+            try #sql("""
+                CREATE TEMP TRIGGER reject_history_import
+                BEFORE INSERT ON pasteboardHistories
+                BEGIN SELECT RAISE(ABORT, 'Simulated import write failure'); END
+                """).execute(database)
+        }
+
+        coordinator.syncNow(reason: .manual, wait: true)
+
+        #expect(historyRepository.fetchHistory(id: remoteID) == nil)
+        #expect(coordinator.status.phase == .failed)
+        try database.write { database in
+            try #sql("DROP TRIGGER reject_history_import").execute(database)
+        }
+        #expect(try provider.historySnapshotFileStates(excludingDeviceID: currentDeviceID) == originalStates)
+
+        coordinator.syncNow(reason: .timer, wait: true)
+
+        #expect(historyRepository.fetchHistory(id: remoteID)?.title == "Retry this import")
+        #expect(coordinator.status.phase == .succeeded)
+        #expect(coordinator.status.importedCount == 1)
     }
 
     @Test
@@ -1362,6 +1621,34 @@ struct SyncCoordinatorTests {
             .appendingPathComponent("sync", isDirectory: true)
     }
 
+    private func writeWatchedRemoteHistory(
+        provider: OneDriveFolderSyncProvider,
+        id: PasteboardHistory.ID,
+        text: String,
+        updatedAt: Int
+    ) throws {
+        try provider.saveHistorySnapshot([
+            PasteboardHistorySyncPayload(
+                id: id.rawValue, text: text, updateAt: updatedAt,
+                deviceID: "remote-device", sourceKind: .plainText
+            )
+        ], deviceID: "remote-device", limit: 2000, maxTextBytes: 256 * 1024,
+           snapshotTextBudgetBytes: 8 * 1024 * 1024)
+    }
+
+    private func waitForHistory(
+        in repository: CountingHistoryRepository,
+        id: PasteboardHistory.ID,
+        text: String
+    ) async throws -> Bool {
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            if repository.payload(id: id.rawValue)?.text == text { return true }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        return repository.payload(id: id.rawValue)?.text == text
+    }
+
     private func makeSettings(
         rootURL: URL,
         historyUpload: Bool = false,
@@ -1575,7 +1862,38 @@ private final class SyncSnippetRepository: SnippetRepositoryProtocol {
 }
 
 private final class CountingHistoryRepository: PasteboardHistoryRepositoryProtocol {
-    var upsertedHistoryIDs = [String]()
+    private let lock = NSLock()
+    private var historyIDs = [String]()
+    private var payloads = [String: PasteboardHistorySyncPayload]()
+    private var filePayloads = [String: FileSyncHistoryPayload]()
+
+    var upsertedHistoryIDs: [String] {
+        get { lock.withLock { historyIDs } }
+        set { lock.withLock { historyIDs = newValue } }
+    }
+
+    func payload(id: String) -> PasteboardHistorySyncPayload? {
+        lock.withLock { payloads[id] }
+    }
+
+    func filePayload(id: String) -> FileSyncHistoryPayload? {
+        lock.withLock { filePayloads[id] }
+    }
+
+    func shouldImportFileSyncHistory(historyID: String, updatedAt: Int) -> Bool {
+        lock.withLock { filePayloads[historyID].map { updatedAt > $0.updatedAt } ?? true }
+    }
+
+    @discardableResult
+    func upsertFileSyncHistory(_ payload: FileSyncHistoryPayload) -> Bool {
+        lock.withLock {
+            guard filePayloads[payload.historyID].map({ $0.updatedAt >= payload.updatedAt }) != true else {
+                return false
+            }
+            filePayloads[payload.historyID] = payload
+            return true
+        }
+    }
 
     func observeHistories() -> AnyPublisher<[PasteboardHistory], Never> {
         Just([]).eraseToAnyPublisher()
@@ -1617,7 +1935,10 @@ private final class CountingHistoryRepository: PasteboardHistoryRepositoryProtoc
 
     @discardableResult
     func upsertSyncPayload(_ payload: PasteboardHistorySyncPayload) -> Bool {
-        upsertedHistoryIDs.append(payload.id)
+        lock.withLock {
+            historyIDs.append(payload.id)
+            payloads[payload.id] = payload
+        }
         return true
     }
 

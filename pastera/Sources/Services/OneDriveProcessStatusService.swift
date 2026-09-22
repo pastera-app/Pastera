@@ -36,18 +36,30 @@ private struct OneDriveProcessMonitoringSnapshot: Equatable {
 private final class OneDriveProcessMonitoringState {
     private let lock = NSLock()
     private var snapshot: OneDriveProcessMonitoringSnapshot
+    private var revision = 0
+    private var isActive = true
 
     init(snapshot: OneDriveProcessMonitoringSnapshot) {
         self.snapshot = snapshot
     }
 
     @discardableResult
-    func update(_ snapshot: OneDriveProcessMonitoringSnapshot) -> Bool {
+    func update(_ snapshot: OneDriveProcessMonitoringSnapshot, expectedRevision: Int? = nil) -> Bool {
         lock.withLock {
+            guard isActive, expectedRevision == nil || expectedRevision == revision else { return false }
+            revision += 1
             guard self.snapshot != snapshot else { return false }
             self.snapshot = snapshot
             return true
         }
+    }
+
+    var currentRevision: Int? {
+        lock.withLock { isActive ? revision : nil }
+    }
+
+    func cancel() {
+        lock.withLock { isActive = false }
     }
 }
 
@@ -66,7 +78,7 @@ struct OneDriveRunningApplicationSnapshot: Equatable {
         self.init(
             bundleIdentifier: application.bundleIdentifier,
             executableURL: application.executableURL,
-            localizedName: application.localizedName
+            localizedName: nil
         )
     }
 }
@@ -98,6 +110,7 @@ protocol OneDriveProcessStatusServicing: AnyObject {
 }
 
 final class OneDriveProcessStatusService: OneDriveProcessStatusServicing {
+    private static let monitoringQueue = DispatchQueue(label: "com.pastera.onedrive-process-monitor", qos: .utility)
     private static let supportedBundleIdentifiers = [
         "com.microsoft.OneDrive-mac",
         "com.microsoft.OneDrive"
@@ -189,17 +202,23 @@ final class OneDriveProcessStatusService: OneDriveProcessStatusServicing {
             onChange()
         }
 
-        let timer = DispatchSource.makeTimerSource(queue: .main)
+        let timer = DispatchSource.makeTimerSource(queue: Self.monitoringQueue)
         let pollInterval = max(0.001, monitoringPollInterval)
         timer.schedule(deadline: .now() + pollInterval, repeating: pollInterval)
         timer.setEventHandler { [weak self] in
             guard let self,
-                  monitoringState.update(self.monitoringSnapshot()) else { return }
-            onChange()
+                  let revision = monitoringState.currentRevision else { return }
+            let snapshot = self.monitoringSnapshot()
+            DispatchQueue.main.async {
+                // A workspace event or cancellation may supersede this background scan.
+                guard monitoringState.update(snapshot, expectedRevision: revision) else { return }
+                onChange()
+            }
         }
         timer.resume()
 
         return OneDriveProcessStatusObservation { [weak notificationCenter] in
+            monitoringState.cancel()
             timer.cancel()
             notificationCenter?.removeObserver(launchObserver)
             notificationCenter?.removeObserver(terminateObserver)

@@ -127,6 +127,13 @@ destructive test at the user's existing `PasteraVault.kdbx`.
   Pastera, and paste it into Notes and Preview.
 - File pasteboard: copy one or more files in Finder, select the history item,
   and paste into Finder or a text target that accepts file URLs.
+- Screen Sharing paste: enable Pastera automatic paste and its Accessibility
+  permission. For local Pastera pasting into a remote Mac, enable Screen
+  Sharing's Edit > Use Shared Clipboard. Focus a disposable remote text field,
+  select a plain-text history item, and confirm the complete text is pasted
+  without a stray `v` or a Chinese input method's `v` composition. Type another
+  ordinary character afterward to confirm Command was released. Repeat with
+  Pastera running on the remote Mac, and with a local text editor as the target.
 - OneDrive sync simulation: use two local Pastera profiles or two macOS user
   accounts that point at the same OneDrive-backed root containing
   `manifest.json`, `histories/`, and `snippets/` directly under the selected

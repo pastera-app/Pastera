@@ -180,20 +180,34 @@ extension ClipService {
         // Copy already copied history
         let isCopySameHistory = AppEnvironment.current.defaults.bool(forKey: Constants.UserDefaults.copySameHistory)
         let historyID = PasteboardHistory.ID(rawValue: content.hash)
-        if !allowDuplicateContent, pasteboardHistoryRepository.fetchHistory(id: historyID) != nil, !isCopySameHistory { return true }
+        let matchingHistory = allowDuplicateContent ? nil : pasteboardHistoryRepository.fetchHistory(matching: content)
+        if matchingHistory != nil, !isCopySameHistory { return true }
 
         // Don't save empty string history
         if content.isOnlyStringType && content.stringValue.isEmpty { return true }
 
         // Overwrite same history
         let isOverwriteHistory = AppEnvironment.current.defaults.bool(forKey: Constants.UserDefaults.overwriteSameHistory)
-        let savedHash = (isOverwriteHistory && !allowDuplicateContent) ? content.hash : UUID().uuidString
+        let savedID: PasteboardHistory.ID
+        if isOverwriteHistory && !allowDuplicateContent {
+            if let matchingHistory {
+                savedID = matchingHistory.id
+            } else if pasteboardHistoryRepository.fetchHistory(id: historyID) == nil {
+                savedID = historyID
+            } else {
+                // Editing preserves identity, so the original hash may now identify different content.
+                savedID = PasteboardHistory.ID(rawValue: UUID().uuidString)
+            }
+        } else {
+            savedID = PasteboardHistory.ID(rawValue: UUID().uuidString)
+        }
 
         let unixTime = Int(Date().timeIntervalSince1970)
-        let savedID = PasteboardHistory.ID(rawValue: savedHash)
-        pasteboardHistoryRepository.save(id: savedID, content: content, updateAt: unixTime)
+        guard let capturedID = pasteboardHistoryRepository.saveCapturedHistory(
+            preferredID: savedID, content: content, updateAt: unixTime
+        ) else { return false }
         pasteboardHistoryRepository.pruneHistories(settings: HistoryRetentionSettings.current())
-        pasteboardHistoryOCRIndexer.enqueueIndexing(historyID: savedID)
+        pasteboardHistoryOCRIndexer.enqueueIndexing(historyID: capturedID)
         return true
     }
 }

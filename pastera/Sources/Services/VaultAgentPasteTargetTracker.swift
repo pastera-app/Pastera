@@ -46,6 +46,7 @@ final class VaultAgentPasteTargetTracker: VaultAgentPasteTargetTracking {
     private let processInspector: VaultAgentProcessInspecting
     private let codeSigningInspector: VaultAgentCodeSigningInspecting
     private let focusedElement: (pid_t) -> AXUIElement?
+    private let activationWorker: DispatchQueue
     private let lock = NSLock()
     private var observer: NSObjectProtocol?
     private var target: StoredTarget?
@@ -85,7 +86,11 @@ final class VaultAgentPasteTargetTracker: VaultAgentPasteTargetTracking {
         runningApplication: @escaping (pid_t) -> VaultAgentPasteApplication?,
         processInspector: VaultAgentProcessInspecting,
         codeSigningInspector: VaultAgentCodeSigningInspecting,
-        focusedElement: @escaping (pid_t) -> AXUIElement?
+        focusedElement: @escaping (pid_t) -> AXUIElement?,
+        activationWorker: DispatchQueue = DispatchQueue(
+            label: "com.pastera-app.Pastera.vault-agent.paste-target",
+            qos: .utility
+        )
     ) {
         self.notificationCenter = notificationCenter
         self.notificationName = notificationName
@@ -97,6 +102,7 @@ final class VaultAgentPasteTargetTracker: VaultAgentPasteTargetTracking {
         self.processInspector = processInspector
         self.codeSigningInspector = codeSigningInspector
         self.focusedElement = focusedElement
+        self.activationWorker = activationWorker
     }
 
     deinit { stop() }
@@ -189,6 +195,18 @@ final class VaultAgentPasteTargetTracker: VaultAgentPasteTargetTracking {
         target = nil
         lock.unlock()
 
+        activationWorker.async { [weak self] in
+            self?.inspectActivatedApplication(application, path: path, generation: candidateGeneration)
+        }
+    }
+
+    private func inspectActivatedApplication(
+        _ application: VaultAgentPasteApplication,
+        path: String,
+        generation candidateGeneration: UInt64
+    ) {
+        // Rapid app switches can queue obsolete targets behind a slow signature check.
+        guard lock.withLock({ started && activationGeneration == candidateGeneration }) else { return }
         let snapshot: VaultAgentProcessSnapshot
         let signature: VaultAgentCodeSignature
         do {
@@ -242,6 +260,7 @@ final class VaultAgentPasteTargetTracker: VaultAgentPasteTargetTracking {
     private static func focusedElement(pid: pid_t) -> AXUIElement? {
         guard AXIsProcessTrusted() else { return nil }
         let application = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(application, 0.2)
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(
             application,

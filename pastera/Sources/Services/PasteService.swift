@@ -388,20 +388,29 @@ extension PasteService {
         AXUIElementSetAttributeValue(focusedElement, kAXFocusedAttribute as CFString, kCFBooleanTrue)
     }
 
-    private static func postPasteCommand() {
+    static func postPasteCommand(postEvent: (CGEvent, CGEventTapLocation) -> Void = { event, location in
+        event.post(tap: location)
+    }) {
         let vKeyCode = PasteShortcutKeyCodeResolver().keyCode(for: "v", carbonModifiers: cmdKey)
         let source = CGEventSource(stateID: .combinedSessionState)
         // Disable local keyboard events while pasting
         source?.setLocalEventsFilterDuringSuppressionState([.permitLocalMouseEvents, .permitSystemDefinedEvents], state: .eventSuppressionStateSuppressionInterval)
-        // Press Command + V
-        let keyVDown = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: true)
-        keyVDown?.flags = .maskCommand
-        // Release Command + V
-        let keyVUp = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: false)
-        keyVUp?.flags = .maskCommand
-        // Post Paste Command
-        keyVDown?.post(tap: .cgAnnotatedSessionEventTap)
-        keyVUp?.post(tap: .cgAnnotatedSessionEventTap)
+        guard let commandDown = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_Command), keyDown: true),
+              let keyVDown = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: true),
+              let keyVUp = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: false),
+              let commandUp = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_Command), keyDown: false) else {
+            return
+        }
+
+        // Remote key forwarders need Command's flagsChanged events; flags on V
+        // alone can arrive as a plain "v". Construct the release before posting.
+        commandDown.flags = .maskCommand
+        keyVDown.flags = .maskCommand
+        keyVUp.flags = .maskCommand
+        commandUp.flags = []
+        for event in [commandDown, keyVDown, keyVUp, commandUp] {
+            postEvent(event, .cgAnnotatedSessionEventTap)
+        }
     }
 
     private static func postTextInput(_ text: String) {

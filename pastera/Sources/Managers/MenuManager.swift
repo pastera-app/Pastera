@@ -917,17 +917,22 @@ extension MenuManager {
         headerView?.connectKeyboardNavigation(to: historyRowViews)
     }
 
-    func fetchHistoryMenuPage() -> HistoryMenuPage {
+    private func currentHistorySearchQuery() -> HistorySearchQuery {
         let ascending = !AppEnvironment.current.defaults.bool(forKey: Constants.UserDefaults.reorderClipsAfterPasting)
-        let limit = historyMenuState.pageSize + 1
-        let query = HistorySearchQuery(
+        return HistorySearchQuery(
             text: historyMenuState.query,
             mode: historyMenuState.mode,
             caseSensitive: historyMenuState.caseSensitive,
             types: historyMenuState.selectedTypes,
             fileCategories: historyMenuState.selectedFileCategories,
-            sortOrder: ascending ? .oldestFirst : .newestFirst
+            sortOrder: ascending ? .oldestFirst : .newestFirst,
+            groupsEquivalentText: AppEnvironment.current.defaults.bool(forKey: Constants.UserDefaults.overwriteSameHistory)
         )
+    }
+
+    func fetchHistoryMenuPage() -> HistoryMenuPage {
+        let limit = historyMenuState.pageSize + 1
+        let query = currentHistorySearchQuery()
         do {
             let details = try pasteboardHistoryRepository.searchHistoryDetails(
                 query: query,
@@ -1004,6 +1009,7 @@ extension MenuManager {
             : nil
         let scriptActions = makeHistoryScriptActions(
             historyID: historyDetail.history.id,
+            pasteboardTypes: historyDetail.history.pasteboardTypes,
             layoutStyle: layoutStyle
         )
         return HistoryMenuRowView(
@@ -1022,9 +1028,10 @@ extension MenuManager {
 
     private func makeHistoryScriptActions(
         historyID: PasteboardHistory.ID,
+        pasteboardTypes: [NSPasteboard.PasteboardType],
         layoutStyle: HistoryMenuRowView.LayoutStyle
     ) -> [HistoryScriptAction] {
-        guard let text = editableTextHistoryContent(historyID) else { return [] }
+        guard isEditablePlainTextHistoryTypes(pasteboardTypes) else { return [] }
         let coordinator = AppEnvironment.current.clipboardScriptCoordinator
         return coordinator.availableHistoryScripts().map { script in
             let target = layoutStyle == .compactMainMenu
@@ -1037,7 +1044,8 @@ extension MenuManager {
                     self?.historyPanelController?.close()
                 }
             }
-            let perform: (@escaping (String) -> Void, @escaping (ScriptExecutionError) -> Void) -> Void = { completion, failure in
+            let perform: (@escaping (String) -> Void, @escaping (ScriptExecutionError) -> Void) -> Void = { [weak self] completion, failure in
+                guard let text = self?.editableTextHistoryContent(historyID) else { return }
                 Task {
                     let outcome = await coordinator.transformHistoryText(
                         text,
@@ -1192,7 +1200,9 @@ extension MenuManager {
     }
 
     func deleteHistory(_ historyID: PasteboardHistory.ID) {
-        pasteboardHistoryRepository.deleteHistory(id: historyID)
+        withErrorReporting {
+            try pasteboardHistoryRepository.deleteDisplayedHistory(id: historyID, query: currentHistorySearchQuery())
+        }
     }
 
     func editableTextHistoryContent(_ historyID: PasteboardHistory.ID) -> String? {

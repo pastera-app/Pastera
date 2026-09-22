@@ -591,6 +591,223 @@ struct PasteboardHistoryRepositoryTests {
     }
 
     @Test
+    func recopyingImportedPlainTextReusesItsRemoteIdentity() throws {
+        let defaults = AppEnvironment.current.defaults
+        let previousOverwrite = defaults.object(forKey: Constants.UserDefaults.overwriteSameHistory)
+        let previousCopySame = defaults.object(forKey: Constants.UserDefaults.copySameHistory)
+        defer {
+            restore(previousOverwrite, forKey: Constants.UserDefaults.overwriteSameHistory, defaults: defaults)
+            restore(previousCopySame, forKey: Constants.UserDefaults.copySameHistory, defaults: defaults)
+        }
+        defaults.set(true, forKey: Constants.UserDefaults.overwriteSameHistory)
+        defaults.set(true, forKey: Constants.UserDefaults.copySameHistory)
+        let remoteID = PasteboardHistory.ID(rawValue: "remote-history-recopy")
+        #expect(try repository.upsertSyncPayload(PasteboardHistorySyncPayload(
+            id: remoteID.rawValue,
+            text: "Imported text",
+            updateAt: 10,
+            deviceID: "remote-device",
+            sourceKind: .plainText
+        )))
+        let pasteboard = makeTextPasteboard("Imported text")
+        defer { pasteboard.clearContents() }
+
+        withDependencies {
+            $0.pasteboardHistoryRepository = repository
+        } operation: {
+            let service = ClipService()
+            service.setStoreTypesForTesting(["String": NSNumber(value: true)])
+            #expect(service.createForTesting(from: pasteboard))
+        }
+
+        let histories = repository.fetchHistoryDetails(ascending: false, includesThumbnailAsset: false, limit: 10)
+        #expect(histories.map(\.history.id) == [remoteID])
+        let recopied = try #require(repository.fetchHistory(id: remoteID))
+        #expect(recopied.updateAt > 10)
+        #expect(repository.fetchContent(id: remoteID)?.assets == [
+            .init(type: .string, data: Data("Imported text".utf8))
+        ])
+    }
+
+    @Test
+    func recopyingOriginalTextAfterEditingPreservesBothContents() throws {
+        let defaults = AppEnvironment.current.defaults
+        let previousOverwrite = defaults.object(forKey: Constants.UserDefaults.overwriteSameHistory)
+        let previousCopySame = defaults.object(forKey: Constants.UserDefaults.copySameHistory)
+        defer {
+            restore(previousOverwrite, forKey: Constants.UserDefaults.overwriteSameHistory, defaults: defaults)
+            restore(previousCopySame, forKey: Constants.UserDefaults.copySameHistory, defaults: defaults)
+        }
+        defaults.set(true, forKey: Constants.UserDefaults.overwriteSameHistory)
+        defaults.set(true, forKey: Constants.UserDefaults.copySameHistory)
+        let original = PasteboardContent("Original text")
+        let editedID = PasteboardHistory.ID(rawValue: original.hash)
+        repository.save(id: editedID, content: original, updateAt: 10)
+        #expect(repository.updateTextHistory(id: editedID, text: "Edited text", updateAt: 20))
+        let pasteboard = makeTextPasteboard("Original text")
+        defer { pasteboard.clearContents() }
+
+        withDependencies {
+            $0.pasteboardHistoryRepository = repository
+        } operation: {
+            let service = ClipService()
+            service.setStoreTypesForTesting(["String": NSNumber(value: true)])
+            #expect(service.createForTesting(from: pasteboard))
+        }
+
+        let histories = repository.fetchHistoryDetails(ascending: false, includesThumbnailAsset: false, limit: 10)
+        #expect(histories.count == 2)
+        #expect(repository.fetchHistory(id: editedID)?.title == "Edited text")
+        #expect(repository.fetchContent(id: editedID)?.stringValue == "Edited text")
+        let recopied = try #require(histories.first { $0.history.id != editedID })
+        #expect(recopied.history.title == "Original text")
+        #expect(repository.fetchContent(id: recopied.history.id)?.stringValue == "Original text")
+    }
+
+    @Test
+    func recopyingMatchedHistoryPreservesAnInterleavedRemoteUpdateAndIndexesTheCapturedID() throws {
+        let defaults = AppEnvironment.current.defaults
+        let previousOverwrite = defaults.object(forKey: Constants.UserDefaults.overwriteSameHistory)
+        let previousCopySame = defaults.object(forKey: Constants.UserDefaults.copySameHistory)
+        defer {
+            restore(previousOverwrite, forKey: Constants.UserDefaults.overwriteSameHistory, defaults: defaults)
+            restore(previousCopySame, forKey: Constants.UserDefaults.copySameHistory, defaults: defaults)
+        }
+        defaults.set(true, forKey: Constants.UserDefaults.overwriteSameHistory)
+        defaults.set(true, forKey: Constants.UserDefaults.copySameHistory)
+        let remoteID = PasteboardHistory.ID(rawValue: "remote-interleaved-capture")
+        try repository.upsertSyncPayload(.init(
+            id: remoteID.rawValue, text: "Captured text", updateAt: 10,
+            deviceID: "remote-device", sourceKind: .plainText
+        ))
+        let interleavingRepository = InterleavingCaptureHistoryRepository(repository: repository) {
+            try repository.upsertSyncPayload(.init(
+                id: remoteID.rawValue, text: "New remote text", updateAt: 20,
+                deviceID: "remote-device", sourceKind: .plainText
+            ))
+        }
+        let indexer = RecordingOCRIndexer()
+        let pasteboard = makeTextPasteboard("Captured text")
+        defer { pasteboard.clearContents() }
+
+        withDependencies {
+            $0.pasteboardHistoryRepository = interleavingRepository
+            $0.pasteboardHistoryOCRIndexer = indexer
+        } operation: {
+            let service = ClipService()
+            service.setStoreTypesForTesting(["String": NSNumber(value: true)])
+            #expect(service.createForTesting(from: pasteboard))
+        }
+
+        #expect(interleavingRepository.interleavingError == nil)
+        #expect(repository.fetchHistory(id: remoteID)?.title == "New remote text")
+        #expect(repository.fetchHistory(id: remoteID)?.updateAt == 20)
+        #expect(repository.fetchContent(id: remoteID)?.stringValue == "New remote text")
+        let histories = repository.fetchHistoryDetails(ascending: false, includesThumbnailAsset: false, limit: 10)
+        #expect(histories.count == 2)
+        let captured = try #require(histories.first { $0.history.id != remoteID })
+        #expect(captured.history.title == "Captured text")
+        #expect(repository.fetchContent(id: captured.history.id)?.stringValue == "Captured text")
+        #expect(indexer.enqueuedHistoryIDs == [captured.history.id])
+    }
+
+    @Test
+    func failedCaptureWriteRetriesWithoutEnqueueingOCR() throws {
+        @Dependency(\.defaultDatabase) var database
+        try database.write { database in
+            try #sql("""
+                CREATE TEMP TRIGGER reject_capture
+                BEFORE INSERT ON pasteboardHistories
+                BEGIN SELECT RAISE(ABORT, 'Simulated capture write failure'); END
+                """).execute(database)
+        }
+        defer { try? database.write { try #sql("DROP TRIGGER reject_capture").execute($0) } }
+        let pasteboard = makeTextPasteboard("Retry capture after write failure")
+        defer { pasteboard.clearContents() }
+        let indexer = RecordingOCRIndexer()
+        var captured = true
+
+        withDependencies {
+            $0.pasteboardHistoryRepository = repository
+            $0.pasteboardHistoryOCRIndexer = indexer
+        } operation: {
+            let service = ClipService()
+            service.setStoreTypesForTesting(["String": NSNumber(value: true)])
+            withKnownIssue("The injected database failure is reported to the application") {
+                captured = service.createForTesting(from: pasteboard)
+            } matching: { issue in
+                issue.description.contains("Simulated capture write failure")
+            }
+        }
+
+        #expect(!captured)
+        #expect(!repository.hasHistories())
+        #expect(indexer.enqueuedHistoryIDs.isEmpty)
+    }
+
+    @Test(arguments: [true, false])
+    func importedTextRecopyHonorsDuplicatePreferences(copySameHistory: Bool) throws {
+        let defaults = AppEnvironment.current.defaults
+        let previousOverwrite = defaults.object(forKey: Constants.UserDefaults.overwriteSameHistory)
+        let previousCopySame = defaults.object(forKey: Constants.UserDefaults.copySameHistory)
+        defer {
+            restore(previousOverwrite, forKey: Constants.UserDefaults.overwriteSameHistory, defaults: defaults)
+            restore(previousCopySame, forKey: Constants.UserDefaults.copySameHistory, defaults: defaults)
+        }
+        defaults.set(false, forKey: Constants.UserDefaults.overwriteSameHistory)
+        defaults.set(copySameHistory, forKey: Constants.UserDefaults.copySameHistory)
+        let remoteID = PasteboardHistory.ID(rawValue: "remote-history-preferences")
+        #expect(try repository.upsertSyncPayload(PasteboardHistorySyncPayload(
+            id: remoteID.rawValue,
+            text: "Imported preference text",
+            updateAt: 10,
+            deviceID: "remote-device",
+            sourceKind: .plainText
+        )))
+        let pasteboard = makeTextPasteboard("Imported preference text")
+        defer { pasteboard.clearContents() }
+
+        withDependencies {
+            $0.pasteboardHistoryRepository = repository
+        } operation: {
+            let service = ClipService()
+            service.setStoreTypesForTesting(["String": NSNumber(value: true)])
+            #expect(service.createForTesting(from: pasteboard))
+        }
+
+        let histories = repository.fetchHistoryDetails(ascending: false, includesThumbnailAsset: false, limit: 10)
+        #expect(histories.count == (copySameHistory ? 2 : 1))
+        #expect(repository.fetchHistory(id: remoteID)?.updateAt == 10)
+        #expect(histories.allSatisfy {
+            repository.fetchContent(id: $0.history.id)?.stringValue == "Imported preference text"
+        })
+    }
+
+    @Test
+    func matchingHistoryRequiresSameFormatsBytesAndAssetOrder() throws {
+        let text = PasteboardContent.Asset(type: .string, data: Data("Same text".utf8))
+        let rich = PasteboardContent.Asset(type: .rtf, data: Data("{\\rtf1 Same text}".utf8))
+        let otherRich = PasteboardContent.Asset(type: .rtf, data: Data("{\\rtf1\\b Same text}".utf8))
+        let richContent = PasteboardContent(assets: [text, rich])
+        let otherRichContent = PasteboardContent(assets: [text, otherRich])
+        let reorderedContent = PasteboardContent(assets: [rich, text])
+        let variants: [(String, PasteboardContent)] = [
+            ("plain", PasteboardContent(assets: [text])),
+            (richContent.hash, richContent),
+            (otherRichContent.hash, otherRichContent),
+            (reorderedContent.hash, reorderedContent)
+        ]
+        for (offset, variant) in variants.enumerated() {
+            repository.save(id: .init(rawValue: variant.0), content: variant.1, updateAt: offset + 1)
+        }
+
+        for (id, content) in variants {
+            #expect(repository.fetchHistory(matching: content)?.id.rawValue == id)
+        }
+        #expect(repository.fetchHistory(matching: PasteboardContent("Different text")) == nil)
+    }
+
+    @Test
     func deleteHistory() throws {
         let content = PasteboardContent("Hello")
         let id = PasteboardHistory.ID(rawValue: content.hash)
@@ -1575,7 +1792,7 @@ struct PasteboardHistorySyncRepositoryTests {
 
         repository.save(id: currentID, content: current, updateAt: 10)
         repository.save(id: oldID, content: old, updateAt: 4)
-        repository.upsertSyncPayload(PasteboardHistorySyncPayload(
+        try repository.upsertSyncPayload(PasteboardHistorySyncPayload(
             id: remoteID.rawValue,
             text: "Remote",
             updateAt: 12,
@@ -1632,7 +1849,7 @@ struct PasteboardHistorySyncRepositoryTests {
 
         try await waitUntil { changeCount >= 1 }
 
-        repository.upsertSyncPayload(PasteboardHistorySyncPayload(
+        try repository.upsertSyncPayload(PasteboardHistorySyncPayload(
             id: "remote-history",
             text: "Remote",
             updateAt: 10,
@@ -1665,7 +1882,7 @@ struct PasteboardHistorySyncRepositoryTests {
             sourceKind: .plainText
         )
 
-        repository.upsertSyncPayload(payload)
+        try repository.upsertSyncPayload(payload)
         #expect(repository.fetchHistory(id: id)?.deviceID == "remote-device")
         #expect(repository.fetchSyncPayloads(
             currentDeviceID: CPYUtilities.deviceID,
@@ -1675,7 +1892,7 @@ struct PasteboardHistorySyncRepositoryTests {
         ).isEmpty)
 
         repository.deleteHistory(id: id)
-        repository.upsertSyncPayload(payload)
+        try repository.upsertSyncPayload(payload)
 
         #expect(repository.fetchHistory(id: id) == nil)
     }
@@ -1701,11 +1918,11 @@ struct PasteboardHistorySyncRepositoryTests {
             sourceKind: .url
         )
 
-        #expect(repository.upsertSyncPayload(olderRemote) == false)
+        #expect(try repository.upsertSyncPayload(olderRemote) == false)
         #expect(repository.fetchHistory(id: id)?.title == "Local newer")
         #expect(repository.fetchContent(id: id) == localContent)
 
-        #expect(repository.upsertSyncPayload(newerRemote) == true)
+        #expect(try repository.upsertSyncPayload(newerRemote) == true)
         #expect(repository.fetchHistory(id: id)?.title == "Remote newer")
         #expect(repository.fetchContent(id: id) == PasteboardContent("Remote newer"))
         #expect(repository.fetchHistory(id: id)?.pasteboardTypes == [.string])
@@ -1953,6 +2170,59 @@ private final class RecordingPasteboardHistoryRepository: PasteboardHistoryRepos
     func pruneHistories(settings: HistoryRetentionSettings) {}
 }
 
+private final class InterleavingCaptureHistoryRepository: PasteboardHistoryRepositoryProtocol {
+    private let repository: PasteboardHistoryRepository
+    private let afterMatching: () throws -> Void
+    private(set) var interleavingError: Error?
+
+    init(repository: PasteboardHistoryRepository, afterMatching: @escaping () throws -> Void) {
+        self.repository = repository
+        self.afterMatching = afterMatching
+    }
+
+    func observeHistories() -> AnyPublisher<[PasteboardHistory], Never> { repository.observeHistories() }
+    func hasHistories() -> Bool { repository.hasHistories() }
+    func fetchHistoryDetails(
+        ascending: Bool, includesThumbnailAsset: Bool, limit: Int, offset: Int
+    ) -> [PasteboardHistoryDetail] {
+        repository.fetchHistoryDetails(
+            ascending: ascending, includesThumbnailAsset: includesThumbnailAsset, limit: limit, offset: offset
+        )
+    }
+    func searchHistoryDetails(
+        query: HistorySearchQuery, includesThumbnailAsset: Bool, limit: Int, offset: Int
+    ) throws -> [PasteboardHistoryDetail] {
+        try repository.searchHistoryDetails(
+            query: query, includesThumbnailAsset: includesThumbnailAsset, limit: limit, offset: offset
+        )
+    }
+    func fetchHistory(id: PasteboardHistory.ID) -> PasteboardHistory? { repository.fetchHistory(id: id) }
+    func fetchHistory(matching content: PasteboardContent) -> PasteboardHistory? {
+        let history = repository.fetchHistory(matching: content)
+        do {
+            try afterMatching()
+        } catch {
+            interleavingError = error
+        }
+        return history
+    }
+    func fetchContent(id: PasteboardHistory.ID) -> PasteboardContent? { repository.fetchContent(id: id) }
+    func save(id: PasteboardHistory.ID, content: PasteboardContent, updateAt: Int) {
+        repository.save(id: id, content: content, updateAt: updateAt)
+    }
+    func saveCapturedHistory(
+        preferredID: PasteboardHistory.ID, content: PasteboardContent, updateAt: Int
+    ) -> PasteboardHistory.ID? {
+        repository.saveCapturedHistory(preferredID: preferredID, content: content, updateAt: updateAt)
+    }
+    func deleteHistory(id: PasteboardHistory.ID) { repository.deleteHistory(id: id) }
+    func deleteAll() { repository.deleteAll() }
+    func deleteOverflowingHistories(maxHistorySize: Int) {
+        repository.deleteOverflowingHistories(maxHistorySize: maxHistorySize)
+    }
+    func pruneHistories(settings: HistoryRetentionSettings) { repository.pruneHistories(settings: settings) }
+}
+
 private final class ControlledOCRScheduler {
     private(set) var pending = [() -> Void]()
 
@@ -2056,12 +2326,14 @@ private func makeRepositoryNoisyImage(width: Int, height: Int) throws -> NSImage
         bytesPerRow: 0,
         bitsPerPixel: 0
     ))
+    let bitmapData = try #require(bitmap.bitmapData)
     for row in 0..<height {
         for column in 0..<width {
-            let red = CGFloat((column * 37 + row * 17) % 256) / 255
-            let green = CGFloat((column * 11 + row * 53) % 256) / 255
-            let blue = CGFloat((column * 23 + row * 29) % 256) / 255
-            bitmap.setColor(NSColor(red: red, green: green, blue: blue, alpha: 1), atX: column, y: row)
+            let index = row * bitmap.bytesPerRow + column * 4
+            bitmapData[index] = UInt8((column * 37 + row * 17) % 256)
+            bitmapData[index + 1] = UInt8((column * 11 + row * 53) % 256)
+            bitmapData[index + 2] = UInt8((column * 23 + row * 29) % 256)
+            bitmapData[index + 3] = 255
         }
     }
     let image = NSImage(size: NSSize(width: width, height: height))
@@ -2832,4 +3104,254 @@ private func waitUntil(condition: @escaping @MainActor () async -> Bool) async t
         try await Task.sleep(for: .seconds(0.01))
     }
     Issue.record("Timed out waiting for condition.")
+}
+
+// MARK: - Non-destructive history display grouping
+
+@MainActor
+@Suite(.dependencies {
+    try $0.bootstrapDatabase()
+})
+struct HistoryDisplayGroupingTests {
+    let repository = PasteboardHistoryRepository()
+
+    @Test(arguments: ["", "same"])
+    func equivalentPlainAndRichTextDisplayOnceWithoutChangingStoredAssets(searchText: String) throws {
+        let plain = [PasteboardContent.Asset(type: .string, data: Data("same text".utf8))]
+        let rich = plain + [PasteboardContent.Asset(type: .rtf, data: Data("{\\rtf1 same text}".utf8))]
+        let html = plain + [PasteboardContent.Asset(type: .html, data: Data("<b>same text</b>".utf8))]
+        let plainID = try insertLegacyHistory("plain", assets: plain, updateAt: 10)
+        let richID = try insertLegacyHistory("rich", assets: rich, updateAt: 20)
+        let htmlID = try insertLegacyHistory("html", assets: html, updateAt: 30)
+
+        let results = try repository.searchHistoryDetails(
+            query: HistorySearchQuery(text: searchText), includesThumbnailAsset: false, limit: 10, offset: 0
+        )
+
+        #expect(results.map(\.history.id) == [htmlID])
+        #expect(repository.fetchContent(id: plainID)?.assets == plain)
+        #expect(repository.fetchContent(id: richID)?.assets == rich)
+        #expect(repository.fetchContent(id: htmlID)?.assets == html)
+        #expect(repository.fetchHistory(id: plainID)?.updateAt == 10)
+        #expect(repository.fetchHistory(id: richID)?.updateAt == 20)
+    }
+
+    @Test(arguments: [HistorySearchQuery.SortOrder.newestFirst, .oldestFirst])
+    func groupingPrecedesPaginationAndOrdersGroupsByLatestCopy(sortOrder: HistorySearchQuery.SortOrder) throws {
+        _ = try insertLegacyHistory("old-copy", text: "shared", updateAt: 10)
+        let middleID = try insertLegacyHistory("middle", text: "middle", updateAt: 30)
+        let latestCopyID = try insertLegacyHistory("latest-copy", text: "shared", updateAt: 50)
+        let newestID = try insertLegacyHistory("newest", text: "newest", updateAt: 60)
+        let query = HistorySearchQuery(text: "", sortOrder: sortOrder)
+
+        let firstPage = try repository.matchingHistoryIDs(query: query, limit: 2, offset: 0)
+        let secondPage = try repository.matchingHistoryIDs(query: query, limit: 2, offset: 2)
+
+        if sortOrder == .newestFirst {
+            #expect(firstPage == [newestID, latestCopyID])
+            #expect(secondPage == [middleID])
+        } else {
+            #expect(firstPage == [middleID, latestCopyID])
+            #expect(secondPage == [newestID])
+        }
+    }
+
+    @Test
+    func typeFilteringKeepsTheMatchingRichVersionWhenTheLatestCopyIsPlain() throws {
+        let richAssets = [
+            PasteboardContent.Asset(type: .string, data: Data("same text".utf8)),
+            PasteboardContent.Asset(type: .rtf, data: Data("{\\rtf1 same text}".utf8))
+        ]
+        let richID = try insertLegacyHistory("rich", assets: richAssets, updateAt: 10)
+        let plainID = try insertLegacyHistory("plain", text: "same text", updateAt: 20)
+
+        let richResults = try repository.searchHistoryDetails(
+            query: HistorySearchQuery(text: "same", types: [.rtf]),
+            includesThumbnailAsset: false, limit: 10, offset: 0
+        )
+        let allResults = try repository.searchHistoryDetails(
+            query: HistorySearchQuery(text: "same"), includesThumbnailAsset: false, limit: 10, offset: 0
+        )
+
+        #expect(richResults.map(\.history.id) == [richID])
+        #expect(allResults.map(\.history.id) == [plainID])
+        #expect(repository.fetchContent(id: richID)?.assets == richAssets)
+    }
+
+    @Test
+    func identicalTruncatedTitlesDoNotHideDifferentCompleteText() throws {
+        let prefix = String(repeating: "x", count: 10_001)
+        _ = try insertLegacyHistory("old-a", text: prefix + "A", updateAt: 10)
+        let differentID = try insertLegacyHistory("different-b", text: prefix + "B", updateAt: 20)
+        let latestID = try insertLegacyHistory("latest-a", text: prefix + "A", updateAt: 30)
+
+        let results = try repository.searchHistoryDetails(
+            query: HistorySearchQuery(text: ""), includesThumbnailAsset: false, limit: 10, offset: 0
+        )
+
+        #expect(results.map(\.history.id) == [latestID, differentID])
+        #expect(repository.fetchContent(id: latestID)?.stringValue == prefix + "A")
+        #expect(repository.fetchContent(id: differentID)?.stringValue == prefix + "B")
+    }
+
+    @Test
+    func canonicallyEquivalentUnicodeWithDifferentBytesRemainsDistinct() throws {
+        let composedID = try insertLegacyHistory("composed", text: "caf\u{00E9}", updateAt: 10)
+        let decomposedID = try insertLegacyHistory("decomposed", text: "cafe\u{0301}", updateAt: 20)
+
+        let results = try repository.searchHistoryDetails(
+            query: HistorySearchQuery(text: "caf"), includesThumbnailAsset: false, limit: 10, offset: 0
+        )
+
+        #expect(results.map(\.history.id) == [decomposedID, composedID])
+    }
+
+    @Test(arguments: [NSPasteboard.PasteboardType.png, .fileURL])
+    func imageAndFilePayloadsAreNotGroupedByTheirSharedText(type: NSPasteboard.PasteboardType) throws {
+        let textAsset = PasteboardContent.Asset(type: .string, data: Data("shared label".utf8))
+        let plainID = try insertLegacyHistory("plain", assets: [textAsset], updateAt: 10)
+        let firstID = try insertLegacyHistory(
+            "first-media", assets: [textAsset, .init(type: type, data: Data("payload-one".utf8))], updateAt: 20
+        )
+        let secondID = try insertLegacyHistory(
+            "second-media", assets: [textAsset, .init(type: type, data: Data("payload-two".utf8))], updateAt: 30
+        )
+
+        let results = try repository.searchHistoryDetails(
+            query: HistorySearchQuery(text: "shared"), includesThumbnailAsset: false, limit: 10, offset: 0
+        )
+
+        #expect(results.map(\.history.id) == [secondID, firstID, plainID])
+    }
+
+    @Test
+    func allowingDuplicateDisplayKeepsEveryFormatVariantAndPaginatesRawRows() throws {
+        let richID = try insertLegacyHistory("rich", assets: [
+            .init(type: .string, data: Data("same text".utf8)),
+            .init(type: .rtf, data: Data("{\\rtf1 same text}".utf8))
+        ], updateAt: 10)
+        let plainID = try insertLegacyHistory("plain", text: "same text", updateAt: 20)
+        let query = HistorySearchQuery(text: "", groupsEquivalentText: false)
+
+        let firstPage = try repository.searchHistoryDetails(
+            query: query, includesThumbnailAsset: false, limit: 1, offset: 0
+        )
+        let secondPage = try repository.searchHistoryDetails(
+            query: query, includesThumbnailAsset: false, limit: 1, offset: 1
+        )
+
+        #expect(firstPage.map(\.history.id) == [plainID])
+        #expect(secondPage.map(\.history.id) == [richID])
+    }
+
+    @Test(arguments: [NSPasteboard.PasteboardType.rtf, .html])
+    func multipleRichTextItemsRemainVisibleAndSurviveDeletingThePlainTextGroup(type: NSPasteboard.PasteboardType) throws {
+        let multiAssets = [
+            PasteboardContent.Asset(type: .string, data: Data("same text".utf8)),
+            .init(type: type, data: Data("first rich item".utf8)),
+            .init(type: type, data: Data("second rich item".utf8))
+        ]
+        let multiID = try insertLegacyHistory("multiple-rich-items", assets: multiAssets, updateAt: 10)
+        let plainID = try insertLegacyHistory("plain", text: "same text", updateAt: 20)
+        let query = HistorySearchQuery(text: "same")
+
+        let results = try repository.searchHistoryDetails(
+            query: query, includesThumbnailAsset: false, limit: 10, offset: 0
+        )
+
+        #expect(results.map(\.history.id) == [plainID, multiID])
+        try repository.deleteDisplayedHistory(id: plainID, query: query)
+        #expect(repository.fetchHistory(id: plainID) == nil)
+        #expect(repository.fetchContent(id: multiID)?.assets == multiAssets)
+    }
+
+    @Test
+    func deletingDisplayedGroupRemovesItsVariantsAndSuppressesEverySyncIdentity() throws {
+        let richID = try insertLegacyHistory("rich", assets: [
+            .init(type: .string, data: Data("same text".utf8)),
+            .init(type: .rtf, data: Data("{\\rtf1 same text}".utf8))
+        ], updateAt: 10)
+        let plainID = try insertLegacyHistory("plain", text: "same text", updateAt: 20)
+        let unrelatedID = try insertLegacyHistory("unrelated", text: "different text", updateAt: 30)
+
+        try repository.deleteDisplayedHistory(id: plainID, query: HistorySearchQuery(text: ""))
+
+        #expect(repository.fetchHistory(id: richID) == nil)
+        #expect(repository.fetchHistory(id: plainID) == nil)
+        #expect(repository.fetchContent(id: richID) == nil)
+        #expect(repository.fetchContent(id: plainID) == nil)
+        #expect(repository.fetchHistory(id: unrelatedID) != nil)
+        @Dependency(\.defaultDatabase) var database
+        let suppressions = try database.read { try SyncSuppression.all.fetchAll($0) }
+        #expect(Set(suppressions.map(\.recordID)) == Set(["rich", "plain"]))
+        for id in [richID, plainID] {
+            #expect(try !repository.upsertSyncPayload(.init(
+                id: id.rawValue, text: "same text", updateAt: 100,
+                deviceID: "remote-device", sourceKind: .plainText
+            )))
+            #expect(repository.fetchHistory(id: id) == nil)
+        }
+    }
+
+    @Test
+    func deletingFilteredDisplayGroupPreservesTheExcludedFormatVariant() throws {
+        let richAssets = [
+            PasteboardContent.Asset(type: .string, data: Data("same text".utf8)),
+            PasteboardContent.Asset(type: .rtf, data: Data("{\\rtf1 same text}".utf8))
+        ]
+        let olderRichID = try insertLegacyHistory("older-rich", assets: richAssets, updateAt: 10)
+        let richID = try insertLegacyHistory("rich", assets: richAssets, updateAt: 20)
+        let plainID = try insertLegacyHistory("plain", text: "same text", updateAt: 30)
+
+        try repository.deleteDisplayedHistory(
+            id: richID, query: HistorySearchQuery(text: "same", types: [.rtf])
+        )
+
+        #expect(repository.fetchHistory(id: olderRichID) == nil)
+        #expect(repository.fetchHistory(id: richID) == nil)
+        #expect(repository.fetchHistory(id: plainID) != nil)
+        @Dependency(\.defaultDatabase) var database
+        let suppressions = try database.read { try SyncSuppression.all.fetchAll($0) }
+        #expect(Set(suppressions.map(\.recordID)) == Set(["older-rich", "rich"]))
+    }
+
+    @Test
+    func deletingWhenDuplicateDisplayIsAllowedRemovesOnlyTheSelectedRow() throws {
+        let firstID = try insertLegacyHistory("first", text: "same text", updateAt: 10)
+        let secondID = try insertLegacyHistory("second", text: "same text", updateAt: 20)
+
+        try repository.deleteDisplayedHistory(
+            id: secondID, query: HistorySearchQuery(text: "", groupsEquivalentText: false)
+        )
+
+        #expect(repository.fetchHistory(id: firstID) != nil)
+        #expect(repository.fetchHistory(id: secondID) == nil)
+        @Dependency(\.defaultDatabase) var database
+        let suppressions = try database.read { try SyncSuppression.all.fetchAll($0) }
+        #expect(suppressions.map(\.recordID) == ["second"])
+    }
+
+    private func insertLegacyHistory(_ id: String, text: String, updateAt: Int) throws -> PasteboardHistory.ID {
+        try insertLegacyHistory(id, assets: [.init(type: .string, data: Data(text.utf8))], updateAt: updateAt)
+    }
+
+    private func insertLegacyHistory(
+        _ rawID: String, assets: [PasteboardContent.Asset], updateAt: Int
+    ) throws -> PasteboardHistory.ID {
+        let id = PasteboardHistory.ID(rawValue: rawID)
+        let content = PasteboardContent(assets: assets)
+        let history = PasteboardHistory(
+            id: id, title: String(content.historyTitle.prefix(10_001)), pasteboardTypes: content.types,
+            updateAt: updateAt, deviceID: "legacy-fixture"
+        )
+        @Dependency(\.defaultDatabase) var database
+        try database.write { db in
+            try PasteboardHistory.upsert { history }.execute(db)
+            let drafts = assets.map {
+                PasteboardHistoryAsset.Draft(pasteboardHistoryID: id, pasteboardType: $0.type, data: $0.data)
+            }
+            try PasteboardHistoryAsset.insert { drafts }.execute(db)
+        }
+        return id
+    }
 }

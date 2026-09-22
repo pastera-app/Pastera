@@ -1063,8 +1063,159 @@ struct OneDriveProcessStatusServiceTests {
     }
 
     @Test
+    func monitoringPollsOffMainThreadAndDeliversChangesOnMainThread() async throws {
+        let appURL = URL(fileURLWithPath: "/Applications/OneDrive.app")
+        let runtimeApplication = OneDriveRunningApplicationSnapshot(
+            bundleIdentifier: "com.microsoft.OneDrive-mac",
+            executableURL: appURL.appendingPathComponent("Contents/MacOS/OneDrive"),
+            localizedName: "OneDrive"
+        )
+        let lock = NSLock()
+        var initialSnapshotRead = false
+        var pollingThreads = [Bool]()
+        var callbackThreads = [Bool]()
+        let service = OneDriveProcessStatusService(
+            applicationURLProvider: { $0 == "com.microsoft.OneDrive-mac" ? appURL : nil },
+            fallbackApplicationURLs: [],
+            fileExists: { $0 == appURL.path },
+            runningApplicationsProvider: {
+                lock.withLock {
+                    guard initialSnapshotRead else {
+                        initialSnapshotRead = true
+                        return []
+                    }
+                    pollingThreads.append(Thread.isMainThread)
+                    return [runtimeApplication]
+                }
+            },
+            openApplication: { _ in true },
+            notificationCenter: NotificationCenter(),
+            monitoringPollInterval: 0.01
+        )
+        let observation = service.startMonitoring {
+            lock.withLock { callbackThreads.append(Thread.isMainThread) }
+        }
+        defer { observation.cancel() }
+
+        for _ in 0..<100 {
+            if lock.withLock({ !callbackThreads.isEmpty }) { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        let observedThreads = lock.withLock { (pollingThreads, callbackThreads) }
+        #expect(!observedThreads.0.isEmpty)
+        #expect(observedThreads.0.allSatisfy { !$0 })
+        #expect(observedThreads.1 == [true])
+    }
+
+    @Test
+    func cancellationSuppressesPendingPollCallback() async throws {
+        let appURL = URL(fileURLWithPath: "/Applications/OneDrive.app")
+        let runtimeApplication = OneDriveRunningApplicationSnapshot(
+            bundleIdentifier: "com.microsoft.OneDrive-mac",
+            executableURL: appURL.appendingPathComponent("Contents/MacOS/OneDrive"),
+            localizedName: "OneDrive"
+        )
+        let lock = NSLock()
+        var snapshotCount = 0
+        var callbackCount = 0
+        var didCancel = false
+        var observation: OneDriveProcessStatusObservation?
+        let service = OneDriveProcessStatusService(
+            applicationURLProvider: { $0 == "com.microsoft.OneDrive-mac" ? appURL : nil },
+            fallbackApplicationURLs: [],
+            fileExists: { $0 == appURL.path },
+            runningApplicationsProvider: {
+                let count = lock.withLock {
+                    snapshotCount += 1
+                    return snapshotCount
+                }
+                guard count > 1 else { return [] }
+                if count == 2 {
+                    // Cancellation is queued ahead of the poll result's main-thread delivery.
+                    DispatchQueue.main.async {
+                        observation?.cancel()
+                        didCancel = true
+                    }
+                }
+                return [runtimeApplication]
+            },
+            openApplication: { _ in true },
+            notificationCenter: NotificationCenter(),
+            monitoringPollInterval: 0.01
+        )
+        observation = service.startMonitoring { callbackCount += 1 }
+        defer { observation?.cancel() }
+
+        for _ in 0..<100 {
+            if didCancel { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try await Task.sleep(for: .milliseconds(30))
+
+        #expect(didCancel)
+        #expect(callbackCount == 0)
+    }
+
+    @Test(arguments: [false, true])
+    func workspaceNotificationSupersedesPendingPollSnapshot(notificationMatchesBaseline: Bool) async throws {
+        let appURL = URL(fileURLWithPath: "/Applications/OneDrive.app")
+        let notificationCenter = NotificationCenter()
+        let runtimeApplication = OneDriveRunningApplicationSnapshot(
+            bundleIdentifier: "com.microsoft.OneDrive-mac",
+            executableURL: appURL.appendingPathComponent("Contents/MacOS/OneDrive"),
+            localizedName: "OneDrive"
+        )
+        let lock = NSLock()
+        var snapshotCount = 0
+        var callbackCount = 0
+        var didDeliverNotification = false
+        let service = OneDriveProcessStatusService(
+            applicationURLProvider: { $0 == "com.microsoft.OneDrive-mac" ? appURL : nil },
+            fallbackApplicationURLs: [],
+            fileExists: { $0 == appURL.path },
+            runningApplicationsProvider: {
+                let count = lock.withLock {
+                    snapshotCount += 1
+                    return snapshotCount
+                }
+                guard count > 1 else { return [] }
+                if count == 2 {
+                    DispatchQueue.main.async {
+                        notificationCenter.post(
+                            name: notificationMatchesBaseline
+                                ? NSWorkspace.didTerminateApplicationNotification
+                                : NSWorkspace.didLaunchApplicationNotification,
+                            object: nil
+                        )
+                        didDeliverNotification = true
+                    }
+                    return notificationMatchesBaseline ? [runtimeApplication] : []
+                }
+                return notificationMatchesBaseline ? [] : [runtimeApplication]
+            },
+            openApplication: { _ in true },
+            notificationCenter: notificationCenter,
+            applicationSnapshotFromNotification: { _ in runtimeApplication },
+            monitoringPollInterval: 0.01
+        )
+        let observation = service.startMonitoring { callbackCount += 1 }
+        defer { observation.cancel() }
+
+        for _ in 0..<100 {
+            if didDeliverNotification { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try await Task.sleep(for: .milliseconds(30))
+
+        #expect(didDeliverNotification)
+        #expect(callbackCount == (notificationMatchesBaseline ? 0 : 1))
+    }
+
+    @Test
     func monitoringPollsForRuntimeMilestonesWhenWorkspaceNotificationIsMissing() async throws {
         let appURL = URL(fileURLWithPath: "/Applications/OneDrive.app")
+        let runningApplicationsLock = NSLock()
         var runningApplications = [OneDriveRunningApplicationSnapshot]()
         var callbackCount = 0
         let service = OneDriveProcessStatusService(
@@ -1075,7 +1226,7 @@ struct OneDriveProcessStatusServiceTests {
             fileExists: { path in
                 URL(fileURLWithPath: path).standardizedFileURL.path == appURL.standardizedFileURL.path
             },
-            runningApplicationsProvider: { runningApplications },
+            runningApplicationsProvider: { runningApplicationsLock.withLock { runningApplications } },
             openApplication: { _ in true },
             notificationCenter: NotificationCenter(),
             monitoringPollInterval: 0.01
@@ -1085,31 +1236,35 @@ struct OneDriveProcessStatusServiceTests {
         }
         defer { observation.cancel() }
 
-        runningApplications = [
-            OneDriveRunningApplicationSnapshot(
-                bundleIdentifier: "com.microsoft.OneDrive-mac",
-                executableURL: appURL.appendingPathComponent("Contents/MacOS/OneDrive"),
-                localizedName: "OneDrive"
-            )
-        ]
+        runningApplicationsLock.withLock {
+            runningApplications = [
+                OneDriveRunningApplicationSnapshot(
+                    bundleIdentifier: "com.microsoft.OneDrive-mac",
+                    executableURL: appURL.appendingPathComponent("Contents/MacOS/OneDrive"),
+                    localizedName: "OneDrive"
+                )
+            ]
+        }
         try await Task.sleep(for: .milliseconds(80))
 
         #expect(callbackCount == 1)
 
-        runningApplications.append(
-            OneDriveRunningApplicationSnapshot(
-                bundleIdentifier: "com.microsoft.OneDrive-mac.FileProvider",
-                executableURL: appURL.appendingPathComponent(
-                    "Contents/PlugIns/OneDrive File Provider.appex/Contents/MacOS/OneDrive File Provider"
-                ),
-                localizedName: "OneDrive File Provider"
+        runningApplicationsLock.withLock {
+            runningApplications.append(
+                OneDriveRunningApplicationSnapshot(
+                    bundleIdentifier: "com.microsoft.OneDrive-mac.FileProvider",
+                    executableURL: appURL.appendingPathComponent(
+                        "Contents/PlugIns/OneDrive File Provider.appex/Contents/MacOS/OneDrive File Provider"
+                    ),
+                    localizedName: "OneDrive File Provider"
+                )
             )
-        )
+        }
         try await Task.sleep(for: .milliseconds(80))
 
         #expect(callbackCount == 2)
 
-        runningApplications = []
+        runningApplicationsLock.withLock { runningApplications = [] }
         try await Task.sleep(for: .milliseconds(80))
 
         #expect(callbackCount == 3)
@@ -1119,6 +1274,7 @@ struct OneDriveProcessStatusServiceTests {
     func monitoringDeduplicatesNotificationsAndStopsAfterCancellation() async throws {
         let appURL = URL(fileURLWithPath: "/Applications/OneDrive.app")
         let notificationCenter = NotificationCenter()
+        let runningApplicationsLock = NSLock()
         var runningApplications = [OneDriveRunningApplicationSnapshot]()
         var callbackCount = 0
         let runtimeApplication = OneDriveRunningApplicationSnapshot(
@@ -1132,7 +1288,7 @@ struct OneDriveProcessStatusServiceTests {
             fileExists: { path in
                 URL(fileURLWithPath: path).standardizedFileURL.path == appURL.standardizedFileURL.path
             },
-            runningApplicationsProvider: { runningApplications },
+            runningApplicationsProvider: { runningApplicationsLock.withLock { runningApplications } },
             openApplication: { _ in true },
             notificationCenter: notificationCenter,
             applicationSnapshotFromNotification: { _ in runtimeApplication },
@@ -1142,7 +1298,7 @@ struct OneDriveProcessStatusServiceTests {
             callbackCount += 1
         }
 
-        runningApplications = [runtimeApplication]
+        runningApplicationsLock.withLock { runningApplications = [runtimeApplication] }
         notificationCenter.post(name: NSWorkspace.didLaunchApplicationNotification, object: nil)
         #expect(callbackCount == 1)
 
@@ -1151,7 +1307,7 @@ struct OneDriveProcessStatusServiceTests {
         #expect(callbackCount == 1)
 
         observation.cancel()
-        runningApplications = []
+        runningApplicationsLock.withLock { runningApplications = [] }
         notificationCenter.post(name: NSWorkspace.didTerminateApplicationNotification, object: nil)
         try await Task.sleep(for: .milliseconds(30))
         #expect(callbackCount == 1)

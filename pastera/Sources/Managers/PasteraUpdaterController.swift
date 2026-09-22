@@ -26,6 +26,7 @@ final class PasteraUpdaterController {
             userDriver: userDriver,
             delegate: nil
         )
+        userDriver.updater = updater
 
         guard startingUpdater else { return }
         do {
@@ -38,7 +39,8 @@ final class PasteraUpdaterController {
 }
 
 @MainActor
-private final class PasteraInformationalUpdateUserDriver: SPUStandardUserDriver {
+final class PasteraInformationalUpdateUserDriver: SPUStandardUserDriver {
+    weak var updater: SPUUpdater?
     private let coordinator: PasteraManualUpdateCoordinator
 
     init(hostBundle: Bundle, coordinator: PasteraManualUpdateCoordinator) {
@@ -51,6 +53,26 @@ private final class PasteraInformationalUpdateUserDriver: SPUStandardUserDriver 
         state: SPUUserUpdateState,
         reply: @escaping (SPUUserUpdateChoice) -> Void
     ) {
+        if !appcastItem.isInformationOnlyUpdate,
+           let releasePageURL = appcastItem.releaseNotesURL ?? appcastItem.infoURL ?? appcastItem.fileURL {
+            super.dismissUpdateInstallation()
+            coordinator.present(
+                update: PasteraManualUpdateDescriptor(
+                    displayVersion: appcastItem.displayVersionString,
+                    currentVersion: Bundle.main.object(
+                        forInfoDictionaryKey: "CFBundleShortVersionString"
+                    ) as? String ?? "—",
+                    releasePageURL: releasePageURL
+                ),
+                mode: .sparkleInstall,
+                stage: state.stage,
+                userInitiated: state.userInitiated,
+                updater: updater,
+                reply: reply
+            )
+            return
+        }
+
         guard appcastItem.isInformationOnlyUpdate,
               let releasePageURL = appcastItem.infoURL,
               (try? PasteraManualUpdateAssetResolver.releaseAPIURL(for: releasePageURL)) != nil else {
@@ -67,6 +89,7 @@ private final class PasteraInformationalUpdateUserDriver: SPUStandardUserDriver 
                 ) as? String ?? "—",
                 releasePageURL: releasePageURL
             ),
+            userInitiated: state.userInitiated,
             reply: reply
         )
     }
@@ -78,15 +101,22 @@ private final class PasteraInformationalUpdateUserDriver: SPUStandardUserDriver 
             super.showUpdateInFocus()
         }
     }
+
+    override func dismissUpdateInstallation() {
+        coordinator.dismiss()
+        super.dismissUpdateInstallation()
+    }
 }
 
 @MainActor
-private final class PasteraManualUpdateCoordinator {
+final class PasteraManualUpdateCoordinator {
     private let downloadService: PasteraManualUpdateDownloadService
     private let workspace: NSWorkspace
     private var windowController: PasteraManualUpdateWindowController?
     private var pendingReply: ((SPUUserUpdateChoice) -> Void)?
     private var currentUpdate: PasteraManualUpdateDescriptor?
+    private var presentationMode = PasteraUpdatePresentationMode.manualDownload
+    private var presentationID: UUID?
     private var downloadedInstallerURL: URL?
     private var isVerifying = false
 
@@ -106,34 +136,61 @@ private final class PasteraManualUpdateCoordinator {
 
     func present(
         update: PasteraManualUpdateDescriptor,
+        mode: PasteraUpdatePresentationMode = .manualDownload,
+        stage: SPUUserUpdateStage = .notDownloaded,
+        userInitiated: Bool = true,
+        updater: SPUUpdater? = nil,
         reply: @escaping (SPUUserUpdateChoice) -> Void
     ) {
-        if let windowController {
+        if windowController != nil {
+            if userInitiated {
+                focusWindow()
+            }
             reply(.dismiss)
-            windowController.showWindow(nil)
-            focusWindow()
             return
         }
 
         currentUpdate = update
+        presentationMode = mode
+        let presentationID = UUID()
+        self.presentationID = presentationID
         pendingReply = reply
         downloadedInstallerURL = nil
         isVerifying = false
         let controller = PasteraManualUpdateWindowController(
             update: update,
+            mode: mode,
+            stage: stage,
+            updater: updater,
             icon: NSApp.applicationIconImage,
             onAction: { [weak self] action in
-                self?.handle(action)
+                guard let self, self.presentationID == presentationID else { return }
+                self.handle(action)
             }
         )
         windowController = controller
-        controller.showWindow(nil)
-        focusWindow()
+        if userInitiated {
+            focusWindow()
+        } else {
+            controller.window?.orderFront(nil)
+        }
     }
 
     func focusWindow() {
         NSApp.activate(ignoringOtherApps: true)
         windowController?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    func dismiss() {
+        pendingReply = nil
+        presentationID = nil
+        let controller = windowController
+        windowController = nil
+        currentUpdate = nil
+        downloadedInstallerURL = nil
+        isVerifying = false
+        downloadService.abandon()
+        controller?.dismiss()
     }
 }
 
@@ -141,7 +198,9 @@ private extension PasteraManualUpdateCoordinator {
     func handle(_ action: PasteraManualUpdateAction) {
         switch action {
         case .download:
-            if let downloadedInstallerURL {
+            if presentationMode == .sparkleInstall {
+                completeSparkleReply(.install)
+            } else if let downloadedInstallerURL {
                 openInstaller(downloadedInstallerURL)
             } else {
                 startDownload()
@@ -155,16 +214,8 @@ private extension PasteraManualUpdateCoordinator {
             }
         case .later:
             completeSparkleReply(.dismiss)
-            downloadService.abandon()
-            windowController = nil
-            currentUpdate = nil
-            downloadedInstallerURL = nil
         case .skip:
             completeSparkleReply(.skip)
-            downloadService.abandon()
-            windowController = nil
-            currentUpdate = nil
-            downloadedInstallerURL = nil
         case .openReleasePage:
             if let releasePageURL = currentUpdate?.releasePageURL {
                 workspace.open(releasePageURL)
@@ -217,7 +268,8 @@ private extension PasteraManualUpdateCoordinator {
 
     func completeSparkleReply(_ choice: SPUUserUpdateChoice) {
         guard let reply = pendingReply else { return }
-        pendingReply = nil
+        // Finish the old presentation before Sparkle synchronously starts its next UI stage.
+        dismiss()
         reply(choice)
     }
 

@@ -111,6 +111,7 @@ struct HistorySearchQuery: Equatable {
     let types: Set<NSPasteboard.PasteboardType>
     let fileCategories: Set<PasteraFinderFileCategory>
     let sortOrder: SortOrder
+    let groupsEquivalentText: Bool
 
     init(
         text: String,
@@ -118,7 +119,8 @@ struct HistorySearchQuery: Equatable {
         caseSensitive: Bool = false,
         types: Set<NSPasteboard.PasteboardType> = [],
         fileCategories: Set<PasteraFinderFileCategory> = [],
-        sortOrder: SortOrder = .newestFirst
+        sortOrder: SortOrder = .newestFirst,
+        groupsEquivalentText: Bool = true
     ) {
         self.text = text
         self.mode = mode
@@ -126,6 +128,7 @@ struct HistorySearchQuery: Equatable {
         self.types = types
         self.fileCategories = fileCategories
         self.sortOrder = sortOrder
+        self.groupsEquivalentText = groupsEquivalentText
     }
 }
 
@@ -180,9 +183,13 @@ protocol PasteboardHistoryRepositoryProtocol {
         offset: Int
     ) throws -> [PasteboardHistoryDetail]
     func fetchHistory(id: PasteboardHistory.ID) -> PasteboardHistory?
+    func fetchHistory(matching content: PasteboardContent) -> PasteboardHistory?
     func fetchContent(id: PasteboardHistory.ID) -> PasteboardContent?
 
     func save(id: PasteboardHistory.ID, content: PasteboardContent, updateAt: Int)
+    func saveCapturedHistory(
+        preferredID: PasteboardHistory.ID, content: PasteboardContent, updateAt: Int
+    ) -> PasteboardHistory.ID?
     @discardableResult
     func createDerivedTextHistory(text: String, updateAt: Int) -> PasteboardHistory.ID?
     @discardableResult
@@ -203,6 +210,7 @@ protocol PasteboardHistoryRepositoryProtocol {
     func deleteOCRJob(historyID: PasteboardHistory.ID)
     func countOCRJobs() -> Int
     func deleteHistory(id: PasteboardHistory.ID)
+    func deleteDisplayedHistory(id: PasteboardHistory.ID, query: HistorySearchQuery) throws
     func deleteAll()
     func deleteOverflowingHistories(maxHistorySize: Int)
     func pruneHistories(settings: HistoryRetentionSettings)
@@ -220,7 +228,7 @@ protocol PasteboardHistoryRepositoryProtocol {
         includedFileTypes: Set<PasteboardAvailableType>
     ) -> FileSyncExportSnapshot
     @discardableResult
-    func upsertSyncPayload(_ payload: PasteboardHistorySyncPayload) -> Bool
+    func upsertSyncPayload(_ payload: PasteboardHistorySyncPayload) throws -> Bool
     func shouldImportFileSyncHistory(historyID: String, updatedAt: Int) -> Bool
     @discardableResult
     func upsertFileSyncHistory(_ payload: FileSyncHistoryPayload) -> Bool
@@ -228,6 +236,23 @@ protocol PasteboardHistoryRepositoryProtocol {
 }
 
 extension PasteboardHistoryRepositoryProtocol {
+    func saveCapturedHistory(
+        preferredID: PasteboardHistory.ID, content: PasteboardContent, updateAt: Int
+    ) -> PasteboardHistory.ID? {
+        save(id: preferredID, content: content, updateAt: updateAt)
+        return preferredID
+    }
+
+    func deleteDisplayedHistory(id: PasteboardHistory.ID, query: HistorySearchQuery) throws {
+        deleteHistory(id: id)
+    }
+
+    func fetchHistory(matching content: PasteboardContent) -> PasteboardHistory? {
+        let id = PasteboardHistory.ID(rawValue: content.hash)
+        guard fetchContent(id: id) == content else { return nil }
+        return fetchHistory(id: id)
+    }
+
     func observeHistoryChanges() -> AnyPublisher<Void, Never> {
         observeHistories()
             .map { _ in () }
@@ -440,7 +465,7 @@ final class PasteboardHistoryRepository: PasteboardHistoryRepositoryProtocol {
         offset: Int
     ) throws -> [PasteboardHistoryDetail] {
         guard limit > 0 else { return [] }
-        if query.text.isEmpty && query.types.isEmpty && query.fileCategories.isEmpty {
+        if !query.groupsEquivalentText && query.text.isEmpty && query.types.isEmpty && query.fileCategories.isEmpty {
             return fetchHistoryDetails(
                 ascending: query.sortOrder == .oldestFirst,
                 includesThumbnailAsset: includesThumbnailAsset,
@@ -461,26 +486,10 @@ final class PasteboardHistoryRepository: PasteboardHistoryRepositoryProtocol {
         guard limit > 0 else { return [] }
 
         let matcher = try makeMatcher(for: query)
-        let candidates = fetchSearchCandidates(ascending: query.sortOrder == .oldestFirst)
-        var skippedMatches = max(0, offset)
-        var matchedIDs = [PasteboardHistory.ID]()
-
-        for candidate in candidates {
-            guard matchesSearchMetadata(candidate, query: query) else { continue }
-            guard matchesSearchText(candidate, query: query, matcher: matcher) else { continue }
-
-            if skippedMatches > 0 {
-                skippedMatches -= 1
-                continue
-            }
-
-            matchedIDs.append(candidate.id)
-            if matchedIDs.count == limit {
-                break
-            }
+        return try database.read { database in
+            let groups = try displayHistoryGroups(query: query, matcher: matcher, database: database)
+            return groups.dropFirst(max(0, offset)).prefix(limit).compactMap { $0.first?.id }
         }
-
-        return matchedIDs
     }
 
     func fetchHistoryDetails(
@@ -526,6 +535,45 @@ final class PasteboardHistoryRepository: PasteboardHistoryRepositoryProtocol {
         }
     }
 
+    func fetchHistory(matching content: PasteboardContent) -> PasteboardHistory? {
+        withErrorReporting {
+            try database.read { database in
+                let hashID = PasteboardHistory.ID(rawValue: content.hash)
+                if let history = try PasteboardHistory.find(hashID).fetchOne(database),
+                   history.pasteboardTypes == content.types {
+                    let assets = try PasteboardHistoryAsset
+                        .where { $0.pasteboardHistoryID.eq(hashID) }
+                        .fetchAll(database)
+                    if assets.map({ PasteboardContent.Asset(type: $0.pasteboardType, data: $0.data) }) == content.assets {
+                        return history
+                    }
+                }
+
+                // Imported and edited plain text can retain an ID unrelated to its current hash.
+                // Other formats must not scan histories that share an empty or generic title.
+                guard Self.isEditablePlainTextHistoryTypes(content.types) else { return nil }
+                let title = content.historyTitle[0...10000]
+                let candidates = try PasteboardHistory
+                    .where { $0.title.eq(title) }
+                    .order { $0.updateAt.desc() }
+                    .fetchAll(database)
+                    .filter { $0.pasteboardTypes == content.types }
+                guard !candidates.isEmpty else { return nil }
+
+                let assets = try PasteboardHistoryAsset
+                    .where { $0.pasteboardHistoryID.in(candidates.map(\.id)) }
+                    .fetchAll(database)
+                let assetsByHistoryID = Dictionary(grouping: assets, by: \.pasteboardHistoryID)
+                return candidates.first { history in
+                    let storedAssets = assetsByHistoryID[history.id, default: []].map {
+                        PasteboardContent.Asset(type: $0.pasteboardType, data: $0.data)
+                    }
+                    return storedAssets == content.assets
+                }
+            }
+        }
+    }
+
     func fetchContent(id: PasteboardHistory.ID) -> PasteboardContent? {
         withErrorReporting {
             try database.read { database in
@@ -545,6 +593,49 @@ final class PasteboardHistoryRepository: PasteboardHistoryRepositoryProtocol {
     }
 
     func save(id: PasteboardHistory.ID, content: PasteboardContent, updateAt: Int) {
+        withErrorReporting {
+            try database.write { database in
+                let exists = try PasteboardHistory.find(id).fetchOne(database) != nil
+                try saveHistory(
+                    id: id, content: content, updateAt: updateAt, insertingAssets: !exists, database: database
+                )
+            }
+        }
+    }
+
+    func saveCapturedHistory(
+        preferredID: PasteboardHistory.ID, content: PasteboardContent, updateAt: Int
+    ) -> PasteboardHistory.ID? {
+        withErrorReporting {
+            try database.write { database in
+                let existingHistory = try PasteboardHistory.find(preferredID).fetchOne(database)
+                var savedID = preferredID
+                if let existingHistory {
+                    let assets = try PasteboardHistoryAsset
+                        .where { $0.pasteboardHistoryID.eq(preferredID) }
+                        .fetchAll(database)
+                        .map { PasteboardContent.Asset(type: $0.pasteboardType, data: $0.data) }
+                    // A remote import or edit may have changed the match after capture looked it up.
+                    if existingHistory.pasteboardTypes != content.types || assets != content.assets {
+                        savedID = PasteboardHistory.ID(rawValue: UUID().uuidString)
+                    }
+                }
+                try saveHistory(
+                    id: savedID, content: content, updateAt: updateAt,
+                    insertingAssets: existingHistory == nil || savedID != preferredID, database: database
+                )
+                return savedID
+            }
+        }
+    }
+
+    private func saveHistory(
+        id: PasteboardHistory.ID,
+        content: PasteboardContent,
+        updateAt: Int,
+        insertingAssets: Bool,
+        database: Database
+    ) throws {
         let facets = Self.contentFacets(pasteboardTypes: content.types)
         let history = PasteboardHistory(
             id: id,
@@ -556,25 +647,14 @@ final class PasteboardHistoryRepository: PasteboardHistoryRepositoryProtocol {
             containsFile: facets.containsFile,
             isTextSyncCandidate: facets.isTextSyncCandidate
         )
-        withErrorReporting {
-            try database.write { database in
-                let exists = try PasteboardHistory
-                    .find(id)
-                    .fetchOne(database) != nil
-                try PasteboardHistory
-                    .upsert { history }
-                    .execute(database)
-                // When a history already exists, its ID is derived from the content hash,
-                // so the assets are guaranteed to be identical and do not need to be inserted again.
-                if !exists {
-                    let assets = content.assets.map {
-                        PasteboardHistoryAsset.Draft(pasteboardHistoryID: id, pasteboardType: $0.type, data: $0.data)
-                    }
-                    try PasteboardHistoryAsset.insert { assets }.execute(database)
-                    if let thumbnailAsset = thumbnailAsset(from: content, id: id) {
-                        try PasteboardHistoryThumbnailAsset.insert { thumbnailAsset }.execute(database)
-                    }
-                }
+        try PasteboardHistory.upsert { history }.execute(database)
+        if insertingAssets {
+            let assets = content.assets.map {
+                PasteboardHistoryAsset.Draft(pasteboardHistoryID: id, pasteboardType: $0.type, data: $0.data)
+            }
+            try PasteboardHistoryAsset.insert { assets }.execute(database)
+            if let thumbnailAsset = thumbnailAsset(from: content, id: id) {
+                try PasteboardHistoryThumbnailAsset.insert { thumbnailAsset }.execute(database)
             }
         }
     }
@@ -799,6 +879,26 @@ final class PasteboardHistoryRepository: PasteboardHistoryRepositoryProtocol {
                     .where { $0.id.eq(id) }
                     .execute(database)
             }
+        }
+    }
+
+    func deleteDisplayedHistory(id: PasteboardHistory.ID, query: HistorySearchQuery) throws {
+        let matcher = try makeMatcher(for: query)
+        try database.write { database in
+            let groups = try displayHistoryGroups(query: query, matcher: matcher, database: database)
+            guard let group = groups.first(where: { $0.contains(where: { $0.id == id }) }) else { return }
+            let ids = group.map(\.id)
+            let suppressedAt = Int(Date().timeIntervalSince1970)
+            let suppressions = ids.map { id in
+                SyncSuppression(
+                    syncIdentity: syncIdentity(kind: .history, id: id.rawValue),
+                    kind: .history,
+                    recordID: id.rawValue,
+                    suppressedAt: suppressedAt
+                )
+            }
+            try SyncSuppression.upsert { suppressions }.execute(database)
+            try PasteboardHistory.delete().where { $0.id.in(ids) }.execute(database)
         }
     }
 
@@ -1155,56 +1255,54 @@ final class PasteboardHistoryRepository: PasteboardHistoryRepositoryProtocol {
     }
 
     @discardableResult
-    func upsertSyncPayload(_ payload: PasteboardHistorySyncPayload) -> Bool {
-        withErrorReporting {
-            try database.write { database in
-                guard try SyncSuppression
-                    .find(syncIdentity(kind: .history, id: payload.id))
-                    .fetchOne(database) == nil else {
-                    return false
-                }
-                let historyID = PasteboardHistory.ID(rawValue: payload.id)
-                if let existingHistory = try PasteboardHistory.find(historyID).fetchOne(database),
-                   payload.updateAt <= existingHistory.updateAt {
-                    return false
-                }
-                try PasteboardHistory
-                    .upsert {
-                            PasteboardHistory(
-                                id: historyID,
-                                title: payload.text[0...10000],
-                                pasteboardTypes: [.string],
-                                updateAt: payload.updateAt,
-                                deviceID: payload.deviceID,
-                                containsImage: false,
-                                containsFile: false,
-                                isTextSyncCandidate: true
-                            )
-                    }
-                    .execute(database)
-                try PasteboardHistoryAsset
-                    .delete()
-                    .where { $0.pasteboardHistoryID.eq(historyID) }
-                    .execute(database)
-                try PasteboardHistoryThumbnailAsset
-                    .delete()
-                    .where { $0.pasteboardHistoryID.eq(historyID) }
-                    .execute(database)
-                try PasteboardHistoryOCRText
-                    .delete()
-                    .where { $0.pasteboardHistoryID.eq(historyID) }
-                    .execute(database)
-                let assets = [
-                    PasteboardHistoryAsset.Draft(
-                        pasteboardHistoryID: historyID,
-                        pasteboardType: .string,
-                        data: Data(payload.text.utf8)
-                    )
-                ]
-                try PasteboardHistoryAsset.insert { assets }.execute(database)
-                return true
+    func upsertSyncPayload(_ payload: PasteboardHistorySyncPayload) throws -> Bool {
+        try database.write { database in
+            guard try SyncSuppression
+                .find(syncIdentity(kind: .history, id: payload.id))
+                .fetchOne(database) == nil else {
+                return false
             }
-        } ?? false
+            let historyID = PasteboardHistory.ID(rawValue: payload.id)
+            if let existingHistory = try PasteboardHistory.find(historyID).fetchOne(database),
+               payload.updateAt <= existingHistory.updateAt {
+                return false
+            }
+            try PasteboardHistory
+                .upsert {
+                        PasteboardHistory(
+                            id: historyID,
+                            title: payload.text[0...10000],
+                            pasteboardTypes: [.string],
+                            updateAt: payload.updateAt,
+                            deviceID: payload.deviceID,
+                            containsImage: false,
+                            containsFile: false,
+                            isTextSyncCandidate: true
+                        )
+                }
+                .execute(database)
+            try PasteboardHistoryAsset
+                .delete()
+                .where { $0.pasteboardHistoryID.eq(historyID) }
+                .execute(database)
+            try PasteboardHistoryThumbnailAsset
+                .delete()
+                .where { $0.pasteboardHistoryID.eq(historyID) }
+                .execute(database)
+            try PasteboardHistoryOCRText
+                .delete()
+                .where { $0.pasteboardHistoryID.eq(historyID) }
+                .execute(database)
+            let assets = [
+                PasteboardHistoryAsset.Draft(
+                    pasteboardHistoryID: historyID,
+                    pasteboardType: .string,
+                    data: Data(payload.text.utf8)
+                )
+            ]
+            try PasteboardHistoryAsset.insert { assets }.execute(database)
+            return true
+        }
     }
 
     @discardableResult
@@ -1355,14 +1453,15 @@ final class PasteboardHistoryRepository: PasteboardHistoryRepositoryProtocol {
     private func matchesSearchText(
         _ candidate: PasteboardHistorySearchCandidate,
         query: HistorySearchQuery,
-        matcher: (String) -> Bool
-    ) -> Bool {
+        matcher: (String) -> Bool,
+        database: Database
+    ) throws -> Bool {
         if matcher(candidate.title) {
             return true
         }
         guard !query.text.isEmpty,
               Self.canHaveOCRImageSource(pasteboardTypes: candidate.pasteboardTypes),
-              let ocrText = fetchOCRText(historyID: candidate.id),
+              let ocrText = try PasteboardHistoryOCRText.find(candidate.id).fetchOne(database),
               !ocrText.recognizedText.isEmpty else {
             return false
         }
@@ -1484,24 +1583,77 @@ private extension PasteboardHistoryRepository {
         PasteboardAvailableType.syncFileType(for: type) != nil
     }
 
-    func fetchSearchCandidates(ascending: Bool) -> [PasteboardHistorySearchCandidate] {
-        withErrorReporting {
-            try database.read { database in
-                let histories = try PasteboardHistory
-                    .all
-                    .order { columns in
-                        if ascending {
-                            columns.updateAt
-                        } else {
-                            columns.updateAt.desc()
-                        }
-                    }
-                    .fetchAll(database)
-                return histories.map { history in
-                    PasteboardHistorySearchCandidate(history: history)
+    func fetchSearchCandidates(database: Database) throws -> [PasteboardHistorySearchCandidate] {
+        try PasteboardHistory.all
+            .order { ($0.updateAt.desc(), $0.id) }
+            .fetchAll(database)
+            .map { PasteboardHistorySearchCandidate(history: $0) }
+    }
+
+    func displayHistoryGroups(
+        query: HistorySearchQuery,
+        matcher: (String) -> Bool,
+        database: Database
+    ) throws -> [[PasteboardHistorySearchCandidate]] {
+        let candidates = try fetchSearchCandidates(database: database).filter {
+            guard matchesSearchMetadata($0, query: query) else { return false }
+            return try matchesSearchText($0, query: query, matcher: matcher, database: database)
+        }
+        let textByID = query.groupsEquivalentText
+            ? try groupingTextForCollisions(candidates: candidates, database: database)
+            : [:]
+        var groups = [[PasteboardHistorySearchCandidate]]()
+        var groupIndexByText = [Data: Int]()
+        for candidate in candidates {
+            if let text = textByID[candidate.id] {
+                if let index = groupIndexByText[text] {
+                    groups[index].append(candidate)
+                    continue
                 }
+                groupIndexByText[text] = groups.count
             }
-        } ?? []
+            groups.append([candidate])
+        }
+        // Candidates are newest first, so a group's first record retains its latest content and timestamp.
+        return query.sortOrder == .oldestFirst ? Array(groups.reversed()) : groups
+    }
+
+    func groupingTextForCollisions(
+        candidates: [PasteboardHistorySearchCandidate],
+        database: Database
+    ) throws -> [PasteboardHistory.ID: Data] {
+        let textTypes: Set<NSPasteboard.PasteboardType> = [.string, .deprecatedString, .rtf, .html]
+        let textCandidates = candidates.filter { candidate in
+            let types = Set(candidate.pasteboardTypes)
+            // Repeated rich-text formats also represent multiple pasteboard items.
+            return types.count == candidate.pasteboardTypes.count
+                && types.isSubset(of: textTypes)
+                && (types.contains(.string) || types.contains(.deprecatedString))
+        }
+        // Titles identify possible collisions only; equality is established from complete asset bytes below.
+        let titleGroups = Dictionary(grouping: textCandidates, by: \.title)
+        let collisionIDs = titleGroups.values.filter { $0.count > 1 }.flatMap { $0.map(\.id) }
+        var textByID = [PasteboardHistory.ID: Data]()
+        let plainTextTypes: [NSPasteboard.PasteboardType] = [.string, .deprecatedString]
+        let batchSize = 100
+        for start in stride(from: 0, to: collisionIDs.count, by: batchSize) {
+            let ids = Array(collisionIDs[start..<min(start + batchSize, collisionIDs.count)])
+            let assets = try PasteboardHistoryAsset
+                .where { $0.pasteboardHistoryID.in(ids) }
+                .where { $0.pasteboardType.in(plainTextTypes) }
+                .fetchAll(database)
+            for (id, textAssets) in Dictionary(grouping: assets, by: \.pasteboardHistoryID) {
+                let current = textAssets.filter { $0.pasteboardType == .string }
+                let legacy = textAssets.filter { $0.pasteboardType == .deprecatedString }
+                // Multiple items and contradictory text representations must retain their separate paste semantics.
+                guard current.count <= 1, legacy.count <= 1,
+                      let text = (current.first ?? legacy.first)?.data,
+                      !text.isEmpty,
+                      legacy.first.map({ $0.data == text }) ?? true else { continue }
+                textByID[id] = text
+            }
+        }
+        return textByID
     }
 
     func makeMatcher(for query: HistorySearchQuery) throws -> (String) -> Bool {

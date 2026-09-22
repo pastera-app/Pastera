@@ -6,6 +6,7 @@
 
 import AppKit
 import Foundation
+import Sparkle
 import Testing
 @testable import Pastera
 
@@ -25,8 +26,8 @@ struct SparkleUpdateFeedTests {
         let shortVersion = try infoPlistValue(forKey: "CFBundleShortVersionString")
         let buildVersion = try infoPlistValue(forKey: "CFBundleVersion")
 
-        #expect(shortVersion == "3.0.5")
-        #expect(buildVersion == "305")
+        #expect(shortVersion == "3.0.6")
+        #expect(buildVersion == "306")
         #expect(shortVersion.wholeMatch(of: /[0-9]+(?:\.[0-9]+)*/) != nil)
         #expect(buildVersion.wholeMatch(of: /[0-9]+/) != nil)
     }
@@ -527,7 +528,6 @@ struct SparkleUpdateFeedTests {
         #expect(updaterSource.contains("PasteraManualUpdateAssetResolver.releaseAPIURL"))
         #expect(updaterSource.contains("super.showUpdateFound"))
         #expect(updaterSource.contains("super.dismissUpdateInstallation()"))
-        #expect(!updaterSource.contains("override func dismissUpdateInstallation"))
 
         let startDownloadRange = try #require(updaterSource.range(of: "func startDownload()"))
         let openInstallerRange = try #require(
@@ -535,6 +535,380 @@ struct SparkleUpdateFeedTests {
         )
         let startDownloadSource = updaterSource[startDownloadRange.lowerBound..<openInstallerRange.lowerBound]
         #expect(!startDownloadSource.contains("completeSparkleReply"))
+    }
+
+    @Test(arguments: [false, true]) @MainActor
+    func scheduledUpdateDoesNotTakeTheCurrentWindowsFocus(informational: Bool) async throws {
+        let currentWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 100),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        currentWindow.isReleasedWhenClosed = false
+        NSApp.activate(ignoringOtherApps: true)
+        currentWindow.makeKeyAndOrderFront(nil)
+        defer { currentWindow.close() }
+        for _ in 0..<50 where NSApp.keyWindow !== currentWindow {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try #require(NSApp.keyWindow === currentWindow)
+
+        let coordinator = PasteraManualUpdateCoordinator()
+        let driver = PasteraInformationalUpdateUserDriver(hostBundle: .main, coordinator: coordinator)
+        defer { driver.dismissUpdateInstallation() }
+        let item = try makeUpdateAppcastItem(
+            informational: informational,
+            releasePageURL: URL(string: "https://github.com/pastera-app/Pastera/releases/tag/v99.0.0-beta")
+        )
+        let state = try makeUserUpdateState(userInitiated: false)
+        driver.showUpdateFound(with: item, state: state) { _ in }
+
+        let window = try visiblePasteraUpdateWindow()
+        #expect(NSApp.keyWindow === currentWindow)
+        #expect(!window.isKeyWindow)
+
+        driver.showUpdateFound(with: item, state: state) { _ in }
+        #expect(NSApp.keyWindow === currentWindow)
+
+        driver.showUpdateInFocus()
+        #expect(NSApp.keyWindow === window)
+    }
+
+    @Test(arguments: [false, true]) @MainActor
+    func installableUpdatePreservesAndChangesAutomaticInstallPreference(initiallyEnabled: Bool) throws {
+        let hostBundle = try makeUpdaterHostBundle(automaticallyDownloadsUpdates: initiallyEnabled)
+        let bundleIdentifier = try #require(hostBundle.bundleIdentifier)
+        defer {
+            UserDefaults.standard.removePersistentDomain(forName: bundleIdentifier)
+            try? FileManager.default.removeItem(at: hostBundle.bundleURL)
+        }
+        let coordinator = PasteraManualUpdateCoordinator()
+        let driver = PasteraInformationalUpdateUserDriver(hostBundle: hostBundle, coordinator: coordinator)
+        let updater = SPUUpdater(hostBundle: hostBundle, applicationBundle: .main, userDriver: driver, delegate: nil)
+        driver.updater = updater
+        defer { driver.dismissUpdateInstallation() }
+        driver.showUpdateFound(with: try makeUpdateAppcastItem(informational: false), state: try makeUserUpdateState()) { _ in }
+        let window = try visiblePasteraUpdateWindow()
+        let contentView = try #require(window.contentView)
+        let checkbox = try #require(
+            contentView.descendant(withAccessibilityIdentifier: "manualUpdate.automaticInstall") as? NSButton
+        )
+        #expect(checkbox.isEnabled)
+        #expect(checkbox.state == (initiallyEnabled ? .on : .off))
+        #expect(updater.automaticallyDownloadsUpdates == initiallyEnabled)
+
+        checkbox.performClick(nil)
+        #expect(updater.automaticallyDownloadsUpdates == !initiallyEnabled)
+        #expect(UserDefaults(suiteName: bundleIdentifier)?.bool(forKey: "SUAutomaticallyUpdate") == !initiallyEnabled)
+
+        updater.automaticallyDownloadsUpdates = initiallyEnabled
+        #expect(checkbox.state == (initiallyEnabled ? .on : .off))
+        updater.automaticallyChecksForUpdates = false
+        #expect(!checkbox.isEnabled)
+        #expect(!updater.automaticallyDownloadsUpdates)
+        #expect(checkbox.state == .off)
+        checkbox.performClick(nil)
+        #expect(UserDefaults(suiteName: bundleIdentifier)?.bool(forKey: "SUAutomaticallyUpdate") == initiallyEnabled)
+        updater.automaticallyChecksForUpdates = true
+        #expect(checkbox.isEnabled)
+        #expect(updater.automaticallyDownloadsUpdates == initiallyEnabled)
+        #expect(checkbox.state == (initiallyEnabled ? .on : .off))
+    }
+
+    @Test @MainActor
+    func installableUpdateCannotEnableAutomaticInstallationWhenHostDisallowsIt() throws {
+        let hostBundle = try makeUpdaterHostBundle(automaticallyDownloadsUpdates: true, allowsAutomaticUpdates: false)
+        let bundleIdentifier = try #require(hostBundle.bundleIdentifier)
+        defer {
+            UserDefaults.standard.removePersistentDomain(forName: bundleIdentifier)
+            try? FileManager.default.removeItem(at: hostBundle.bundleURL)
+        }
+        let coordinator = PasteraManualUpdateCoordinator()
+        let driver = PasteraInformationalUpdateUserDriver(hostBundle: hostBundle, coordinator: coordinator)
+        let updater = SPUUpdater(hostBundle: hostBundle, applicationBundle: .main, userDriver: driver, delegate: nil)
+        driver.updater = updater
+        defer { driver.dismissUpdateInstallation() }
+        driver.showUpdateFound(with: try makeUpdateAppcastItem(informational: false), state: try makeUserUpdateState()) { _ in }
+        let contentView = try #require(visiblePasteraUpdateWindow().contentView)
+        let checkbox = try #require(
+            contentView.descendant(withAccessibilityIdentifier: "manualUpdate.automaticInstall") as? NSButton
+        )
+
+        #expect(!checkbox.isEnabled)
+        #expect(checkbox.state == .off)
+        checkbox.performClick(nil)
+        #expect(!updater.automaticallyDownloadsUpdates)
+        #expect(UserDefaults(suiteName: bundleIdentifier)?.object(forKey: "SUAutomaticallyUpdate") == nil)
+    }
+
+    @Test(arguments: [SPUUserUpdateStage.notDownloaded, .downloaded, .installing]) @MainActor
+    func installableUpdateRepliesInstallOnceFromUpdateButtonAndRestoresFocus(stage: SPUUserUpdateStage) throws {
+        let coordinator = PasteraManualUpdateCoordinator()
+        let driver = PasteraInformationalUpdateUserDriver(hostBundle: .main, coordinator: coordinator)
+        defer { driver.dismissUpdateInstallation() }
+        let item = try makeUpdateAppcastItem(informational: false)
+        let state = try makeUserUpdateState(stage: stage)
+        var replies: [SPUUserUpdateChoice] = []
+
+        driver.showUpdateFound(with: item, state: state) { replies.append($0) }
+        let window = try visiblePasteraUpdateWindow()
+        defer { window.close() }
+        let contentView = try #require(window.contentView)
+        let updateButton = try #require(
+            contentView.descendant(withAccessibilityIdentifier: "manualUpdate.download") as? NSButton
+        )
+        #expect(updateButton.title == Bundle.main.localizedString(forKey: "Update", value: "Update", table: nil))
+        window.orderOut(nil)
+        driver.showUpdateInFocus()
+        #expect(window.isVisible)
+
+        updateButton.performClick(nil)
+        updateButton.performClick(nil)
+        window.close()
+
+        #expect(replies == [.install])
+        #expect(!window.isVisible)
+        #expect(!coordinator.isPresentingManualUpdate)
+    }
+
+    @Test(arguments: ["manualUpdate.later", "manualUpdate.skip", "close"]) @MainActor
+    func installableUpdateDismissalRepliesExactlyOnce(actionIdentifier: String) throws {
+        let coordinator = PasteraManualUpdateCoordinator()
+        let driver = PasteraInformationalUpdateUserDriver(hostBundle: .main, coordinator: coordinator)
+        defer { driver.dismissUpdateInstallation() }
+        var replies: [SPUUserUpdateChoice] = []
+        driver.showUpdateFound(with: try makeUpdateAppcastItem(informational: false), state: try makeUserUpdateState()) {
+            replies.append($0)
+        }
+        let window = try visiblePasteraUpdateWindow()
+        defer { window.close() }
+        if actionIdentifier == "close" {
+            window.performClose(nil)
+        } else {
+            let contentView = try #require(window.contentView)
+            let button = try #require(contentView.descendant(withAccessibilityIdentifier: actionIdentifier) as? NSButton)
+            button.performClick(nil)
+            button.performClick(nil)
+        }
+        window.close()
+
+        #expect(replies == [actionIdentifier == "manualUpdate.skip" ? .skip : .dismiss])
+        #expect(!coordinator.isPresentingManualUpdate)
+    }
+
+    @Test(arguments: [SPUUserUpdateStage.notDownloaded, .downloaded, .installing]) @MainActor
+    func installableUpdateLaterActionDescribesTheActualSparkleStage(stage: SPUUserUpdateStage) throws {
+        let coordinator = PasteraManualUpdateCoordinator()
+        let driver = PasteraInformationalUpdateUserDriver(hostBundle: .main, coordinator: coordinator)
+        defer { driver.dismissUpdateInstallation() }
+        var replies: [SPUUserUpdateChoice] = []
+        driver.showUpdateFound(
+            with: try makeUpdateAppcastItem(informational: false),
+            state: try makeUserUpdateState(stage: stage)
+        ) { replies.append($0) }
+        let window = try visiblePasteraUpdateWindow()
+        defer { window.close() }
+        let contentView = try #require(window.contentView)
+        let laterButton = try #require(
+            contentView.descendant(withAccessibilityIdentifier: "manualUpdate.later") as? NSButton
+        )
+        let statusLabel = try #require(
+            contentView.descendant(withAccessibilityIdentifier: "manualUpdate.status") as? NSTextField
+        )
+        let expectedTitle = stage == .installing ? "Install on Quit" : "Remind Me Later"
+        let expectedStatus: String
+        switch stage {
+        case .notDownloaded:
+            expectedStatus = "Download and install this update, then restart Pastera."
+        case .downloaded:
+            expectedStatus = "The update has been downloaded and is ready to install."
+        case .installing:
+            expectedStatus = "The update is ready. Update now to restart Pastera, or install it when Pastera quits."
+        @unknown default:
+            Issue.record("Unexpected Sparkle update stage")
+            return
+        }
+        #expect(laterButton.title == Bundle.main.localizedString(
+            forKey: expectedTitle, value: expectedTitle, table: nil
+        ))
+        #expect(statusLabel.stringValue == Bundle.main.localizedString(
+            forKey: expectedStatus, value: expectedStatus, table: nil
+        ))
+
+        laterButton.performClick(nil)
+        window.close()
+
+        #expect(replies == [.dismiss])
+    }
+
+    @Test @MainActor
+    func repeatedInstallableUpdatePresentationKeepsTheOriginalReplyAndWindow() throws {
+        let coordinator = PasteraManualUpdateCoordinator()
+        let driver = PasteraInformationalUpdateUserDriver(hostBundle: .main, coordinator: coordinator)
+        defer { driver.dismissUpdateInstallation() }
+        let item = try makeUpdateAppcastItem(informational: false)
+        let state = try makeUserUpdateState()
+        var firstReplies: [SPUUserUpdateChoice] = []
+        var repeatedReplies: [SPUUserUpdateChoice] = []
+        driver.showUpdateFound(with: item, state: state) { firstReplies.append($0) }
+        let originalWindow = try visiblePasteraUpdateWindow()
+        defer { originalWindow.close() }
+
+        driver.showUpdateFound(with: item, state: state) { repeatedReplies.append($0) }
+
+        #expect(firstReplies.isEmpty)
+        #expect(repeatedReplies == [.dismiss])
+        #expect(try visiblePasteraUpdateWindow() === originalWindow)
+        let contentView = try #require(originalWindow.contentView)
+        let button = try #require(
+            contentView.descendant(withAccessibilityIdentifier: "manualUpdate.download") as? NSButton
+        )
+        button.performClick(nil)
+        #expect(firstReplies == [.install])
+        #expect(repeatedReplies == [.dismiss])
+    }
+
+    @Test @MainActor
+    func installableUpdateReplyCanReenterPresentationWithoutLosingTheNewWindow() throws {
+        let coordinator = PasteraManualUpdateCoordinator()
+        let driver = PasteraInformationalUpdateUserDriver(hostBundle: .main, coordinator: coordinator)
+        defer { driver.dismissUpdateInstallation() }
+        let item = try makeUpdateAppcastItem(informational: false)
+        let state = try makeUserUpdateState()
+        var firstReplies: [SPUUserUpdateChoice] = []
+        var nextReplies: [SPUUserUpdateChoice] = []
+        driver.showUpdateFound(with: item, state: state) { choice in
+            firstReplies.append(choice)
+            driver.showUpdateFound(with: item, state: state) { nextReplies.append($0) }
+        }
+        let originalWindow = try visiblePasteraUpdateWindow()
+        defer { originalWindow.close() }
+        let originalContentView = try #require(originalWindow.contentView)
+        let button = try #require(
+            originalContentView.descendant(withAccessibilityIdentifier: "manualUpdate.download") as? NSButton
+        )
+
+        button.performClick(nil)
+
+        #expect(firstReplies == [.install])
+        #expect(nextReplies.isEmpty)
+        let nextWindow = try visiblePasteraUpdateWindow()
+        #expect(nextWindow !== originalWindow)
+        nextWindow.performClose(nil)
+        #expect(nextReplies == [.dismiss])
+        #expect(firstReplies == [.install])
+    }
+
+    @Test @MainActor
+    func informationalDirectDownloadKeepsBrowserFallbackAndNeverRepliesInstall() throws {
+        let coordinator = PasteraManualUpdateCoordinator()
+        let driver = PasteraInformationalUpdateUserDriver(hostBundle: .main, coordinator: coordinator)
+        defer { driver.dismissUpdateInstallation() }
+        let item = try makeUpdateAppcastItem(informational: true)
+        var replies: [SPUUserUpdateChoice] = []
+
+        driver.showUpdateFound(with: item, state: try makeUserUpdateState()) { replies.append($0) }
+
+        #expect(item.isInformationOnlyUpdate)
+        #expect(!coordinator.isPresentingManualUpdate)
+        #expect(!replies.contains(.install))
+    }
+
+    @Test @MainActor
+    func sparkleDismissalClosesTheCustomPromptWithoutReplyingAgain() throws {
+        let coordinator = PasteraManualUpdateCoordinator()
+        let driver = PasteraInformationalUpdateUserDriver(hostBundle: .main, coordinator: coordinator)
+        var replies: [SPUUserUpdateChoice] = []
+        driver.showUpdateFound(with: try makeUpdateAppcastItem(informational: false), state: try makeUserUpdateState()) {
+            replies.append($0)
+        }
+        let window = try visiblePasteraUpdateWindow()
+        let contentView = try #require(window.contentView)
+        let updateButton = try #require(
+            contentView.descendant(withAccessibilityIdentifier: "manualUpdate.download") as? NSButton
+        )
+
+        driver.dismissUpdateInstallation()
+        driver.dismissUpdateInstallation()
+        updateButton.performClick(nil)
+        window.close()
+
+        #expect(!window.isVisible)
+        #expect(!coordinator.isPresentingManualUpdate)
+        #expect(replies.isEmpty)
+    }
+
+    @Test
+    func installableUpdateActionHasExactEnglishAndSimplifiedChineseLabels() throws {
+        let catalogURL = projectRoot().appendingPathComponent("pastera/Resources/Localizable.xcstrings")
+        let catalog = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: catalogURL)) as? [String: Any])
+        let strings = try #require(catalog["strings"] as? [String: Any])
+        let update = try #require(strings["Update"] as? [String: Any])
+        let localizations = try #require(update["localizations"] as? [String: [String: [String: String]]])
+        #expect(localizations["en"]?["stringUnit"]?["value"] == "Update")
+        #expect(localizations["zh-Hans"]?["stringUnit"]?["value"] == "更新")
+    }
+
+    @MainActor
+    private func visiblePasteraUpdateWindow() throws -> NSWindow {
+        try #require(NSApp.windows.first {
+            $0.isVisible && $0.contentView?.descendant(withAccessibilityIdentifier: "manualUpdate.download") != nil
+        })
+    }
+
+    private func makeUpdateAppcastItem(informational: Bool, releasePageURL: URL? = nil) throws -> SUAppcastItem {
+        let downloadURL = "https://github.com/pastera-app/Pastera/releases/download/v99.0.0-beta/Pastera-99.0.0-beta-macOS.dmg"
+        var properties: [String: Any] = [
+            "title": "Pastera 99.0.0",
+            "sparkle:version": "9900",
+            "sparkle:shortVersionString": "99.0.0",
+            "link": releasePageURL?.absoluteString ?? downloadURL
+        ]
+        if !informational {
+            properties["enclosure"] = [
+                "url": downloadURL,
+                "length": "1024",
+                "type": "application/x-apple-diskimage"
+            ]
+        }
+        return try #require(SUAppcastItem(dictionary: properties))
+    }
+
+    private func makeUserUpdateState(
+        stage: SPUUserUpdateStage = .notDownloaded,
+        userInitiated: Bool = true
+    ) throws -> SPUUserUpdateState {
+        // Exercise Sparkle's public secure-coding initializer without private selectors.
+        let archiver = NSKeyedArchiver(requiringSecureCoding: true)
+        archiver.encode(stage.rawValue, forKey: "SPUUserUpdateStateStage")
+        archiver.encode(userInitiated, forKey: "SPUUserUpdateStateUserInitiated")
+        archiver.finishEncoding()
+        let unarchiver = try NSKeyedUnarchiver(forReadingFrom: archiver.encodedData)
+        defer { unarchiver.finishDecoding() }
+        return try #require(SPUUserUpdateState(coder: unarchiver))
+    }
+
+    private func makeUpdaterHostBundle(
+        automaticallyDownloadsUpdates: Bool,
+        allowsAutomaticUpdates: Bool? = nil
+    ) throws -> Bundle {
+        let identifier = "app.pastera.update-tests.\(UUID().uuidString)"
+        let bundleURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(identifier).app")
+        let contentsURL = bundleURL.appendingPathComponent("Contents", isDirectory: true)
+        try FileManager.default.createDirectory(at: contentsURL, withIntermediateDirectories: true)
+        var info: [String: Any] = [
+            "CFBundleIdentifier": identifier,
+            "CFBundleName": "Pastera Update Tests",
+            "CFBundleVersion": "1",
+            "CFBundleShortVersionString": "1.0",
+            "SUEnableAutomaticChecks": true,
+            "SUAutomaticallyUpdate": automaticallyDownloadsUpdates
+        ]
+        if let allowsAutomaticUpdates {
+            info["SUAllowsAutomaticUpdates"] = allowsAutomaticUpdates
+        }
+        try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+            .write(to: contentsURL.appendingPathComponent("Info.plist"))
+        return try #require(Bundle(url: bundleURL))
     }
 
     @Test @MainActor

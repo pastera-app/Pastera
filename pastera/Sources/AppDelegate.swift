@@ -494,7 +494,7 @@ extension AppDelegate: NSApplicationDelegate {
         screenshotObserver.start()
 
         // Clean datas every 30 minutes
-        Observable<Int>.interval(.seconds(60 * 30), scheduler: MainScheduler.asyncInstance)
+        Observable<Int>.interval(.seconds(60 * 30), scheduler: SerialDispatchQueueScheduler(qos: .utility))
             .subscribe(onNext: { [weak self] _ in
                 self?.pasteboardHistoryRepository.pruneHistories(settings: HistoryRetentionSettings.current())
             })
@@ -760,7 +760,8 @@ private final class HistorySearchWindowController: NSWindowController, NSSearchF
             caseSensitive: caseButton.state == .on,
             types: selectedTypes,
             fileCategories: selectedFileCategories,
-            sortOrder: .newestFirst
+            sortOrder: .newestFirst,
+            groupsEquivalentText: AppEnvironment.current.defaults.bool(forKey: Constants.UserDefaults.overwriteSameHistory)
         )
         statusLabel.stringValue = appending ? "Loading..." : "Searching..."
         loadMoreButton.isEnabled = false

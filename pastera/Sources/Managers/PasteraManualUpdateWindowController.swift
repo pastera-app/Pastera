@@ -5,6 +5,7 @@
 //
 
 import AppKit
+import Sparkle
 
 struct PasteraManualUpdateDescriptor: Equatable, Sendable {
     let displayVersion: String
@@ -20,6 +21,11 @@ enum PasteraManualUpdateAction: Equatable {
     case openReleasePage
 }
 
+enum PasteraUpdatePresentationMode {
+    case manualDownload
+    case sparkleInstall
+}
+
 @MainActor
 final class PasteraManualUpdateWindowController: NSWindowController, NSWindowDelegate {
     private enum Layout {
@@ -29,21 +35,33 @@ final class PasteraManualUpdateWindowController: NSWindowController, NSWindowDel
     }
 
     private let update: PasteraManualUpdateDescriptor
+    private let mode: PasteraUpdatePresentationMode
+    private let stage: SPUUserUpdateStage
+    private weak var updater: SPUUpdater?
     private let onAction: (PasteraManualUpdateAction) -> Void
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
     private let progressIndicator = NSProgressIndicator()
     private let downloadButton = NSButton(title: "", target: nil, action: nil)
     private let laterButton = NSButton(title: "", target: nil, action: nil)
     private let skipButton = NSButton(title: "", target: nil, action: nil)
+    private let automaticInstallButton = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+    private var automaticUpdateObservations: [NSKeyValueObservation] = []
     private var isDownloading = false
     private var invokesLaterWhenClosing = true
+    private var isClosing = false
 
     init(
         update: PasteraManualUpdateDescriptor,
+        mode: PasteraUpdatePresentationMode = .manualDownload,
+        stage: SPUUserUpdateStage = .notDownloaded,
+        updater: SPUUpdater? = nil,
         icon: NSImage,
         onAction: @escaping (PasteraManualUpdateAction) -> Void
     ) {
         self.update = update
+        self.mode = mode
+        self.stage = stage
+        self.updater = updater
         self.onAction = onAction
 
         let window = NSWindow(
@@ -58,6 +76,20 @@ final class PasteraManualUpdateWindowController: NSWindowController, NSWindowDel
         super.init(window: window)
         window.delegate = self
         window.contentView = makeContentView(icon: icon)
+        if mode == .sparkleInstall, let updater {
+            automaticUpdateObservations = [
+                updater.observe(\.automaticallyDownloadsUpdates, options: [.initial, .new]) { [weak self] updater, _ in
+                    MainActor.assumeIsolated {
+                        self?.automaticInstallButton.state = updater.automaticallyDownloadsUpdates ? .on : .off
+                    }
+                },
+                updater.observe(\.allowsAutomaticUpdates, options: [.initial, .new]) { [weak self] updater, _ in
+                    MainActor.assumeIsolated {
+                        self?.automaticInstallButton.isEnabled = updater.allowsAutomaticUpdates
+                    }
+                }
+            ]
+        }
     }
 
     @available(*, unavailable)
@@ -118,9 +150,17 @@ final class PasteraManualUpdateWindowController: NSWindowController, NSWindowDel
     }
 
     func windowWillClose(_ notification: Notification) {
+        guard !isClosing else { return }
+        isClosing = true
         if invokesLaterWhenClosing {
             onAction(.later)
         }
+    }
+
+    func dismiss() {
+        invokesLaterWhenClosing = false
+        guard !isClosing else { return }
+        close()
     }
 }
 
@@ -162,9 +202,22 @@ private extension PasteraManualUpdateWindowController {
         headingStack.spacing = 8
         headingStack.translatesAutoresizingMaskIntoConstraints = false
 
-        statusLabel.stringValue = Self.localized(
-            "Download the verified disk image here, then finish installation in Finder."
-        )
+        let statusMessage: String
+        if mode == .sparkleInstall {
+            switch stage {
+            case .notDownloaded:
+                statusMessage = "Download and install this update, then restart Pastera."
+            case .downloaded:
+                statusMessage = "The update has been downloaded and is ready to install."
+            case .installing:
+                statusMessage = "The update is ready. Update now to restart Pastera, or install it when Pastera quits."
+            @unknown default:
+                statusMessage = "Download and install this update, then restart Pastera."
+            }
+        } else {
+            statusMessage = "Download the verified disk image here, then finish installation in Finder."
+        }
+        statusLabel.stringValue = Self.localized(statusMessage)
         statusLabel.font = .systemFont(ofSize: 13)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.maximumNumberOfLines = 4
@@ -195,6 +248,20 @@ private extension PasteraManualUpdateWindowController {
         buttonRow.translatesAutoresizingMaskIntoConstraints = false
 
         [iconView, headingStack, statusCard, buttonRow].forEach(root.addSubview)
+        if mode == .sparkleInstall {
+            automaticInstallButton.title = Self.localized("Automatically download and install updates in the future")
+            automaticInstallButton.target = self
+            automaticInstallButton.action = #selector(automaticInstallChanged)
+            automaticInstallButton.isEnabled = false
+            automaticInstallButton.setAccessibilityIdentifier("manualUpdate.automaticInstall")
+            automaticInstallButton.translatesAutoresizingMaskIntoConstraints = false
+            root.addSubview(automaticInstallButton)
+            NSLayoutConstraint.activate([
+                automaticInstallButton.leadingAnchor.constraint(equalTo: buttonRow.leadingAnchor),
+                automaticInstallButton.trailingAnchor.constraint(lessThanOrEqualTo: buttonRow.trailingAnchor),
+                automaticInstallButton.bottomAnchor.constraint(equalTo: buttonRow.topAnchor, constant: -14)
+            ])
+        }
 
         NSLayoutConstraint.activate([
             iconView.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: Layout.margin),
@@ -231,13 +298,15 @@ private extension PasteraManualUpdateWindowController {
         skipButton.bezelStyle = .rounded
         skipButton.setAccessibilityIdentifier("manualUpdate.skip")
 
-        laterButton.title = Self.localized("Remind Me Later")
+        laterButton.title = Self.localized(mode == .sparkleInstall && stage == .installing
+            ? "Install on Quit"
+            : "Remind Me Later")
         laterButton.target = self
         laterButton.action = #selector(remindLater)
         laterButton.bezelStyle = .rounded
         laterButton.setAccessibilityIdentifier("manualUpdate.later")
 
-        downloadButton.title = Self.localized("Download Update")
+        downloadButton.title = Self.localized(mode == .sparkleInstall ? "Update" : "Download Update")
         downloadButton.target = self
         downloadButton.action = #selector(downloadUpdate)
         downloadButton.bezelStyle = .rounded
@@ -258,16 +327,21 @@ private extension PasteraManualUpdateWindowController {
         onAction(isDownloading ? .cancelDownload : .download)
     }
 
+    @objc func automaticInstallChanged() {
+        guard let updater, updater.allowsAutomaticUpdates else { return }
+        updater.automaticallyDownloadsUpdates = automaticInstallButton.state == .on
+    }
+
     @objc func remindLater() {
         invokesLaterWhenClosing = false
         onAction(.later)
-        close()
+        dismiss()
     }
 
     @objc func skipUpdate() {
         invokesLaterWhenClosing = false
         onAction(.skip)
-        close()
+        dismiss()
     }
 
     @objc func openReleasePage() {
