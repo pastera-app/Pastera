@@ -214,6 +214,69 @@ struct PasswordVaultSyncServiceTests {
         #expect(fixture.service.snapshot.phase == .synced)
     }
 
+    @Test("repeated sync requests waiting on the vault queue coalesce into one cloud read")
+    func queuedSynchronizationsCoalesceIntoSingleRun() throws {
+        let local = Data("unchanged-local".utf8)
+        let remote = Data("unchanged-remote".utf8)
+        var metadata = PasswordVaultSyncMetadata.defaultLocalOnly
+        metadata.mode = .oneDrive
+        metadata.lastSyncedLocalDigest = PasswordVaultDigest.hex(local)
+        metadata.lastObservedRemoteDigest = PasswordVaultDigest.hex(remote)
+        let fixture = try makeSyncServiceFixture(metadata: metadata, localData: local)
+        fixture.cloud.snapshot = PasswordVaultCloudSnapshot(
+            data: remote,
+            digest: PasswordVaultDigest.hex(remote)
+        )
+
+        fixture.queue.suspend()
+        for _ in 0..<20 {
+            fixture.service.synchronize(reason: .manual)
+        }
+        fixture.queue.resume()
+        fixture.drain()
+
+        #expect(fixture.cloud.readCount == 1)
+        #expect(fixture.cloud.writes.isEmpty)
+        #expect(fixture.access.mergeCount == 0)
+        #expect(fixture.service.snapshot.phase == .synced)
+    }
+
+    @Test("repeated requests during active sync retain only one follow-up cloud read")
+    func activeSynchronizationsCoalesceIntoSingleFollowUp() throws {
+        let local = Data("unchanged-local".utf8)
+        let remote = Data("unchanged-remote".utf8)
+        var metadata = PasswordVaultSyncMetadata.defaultLocalOnly
+        metadata.mode = .oneDrive
+        metadata.lastSyncedLocalDigest = PasswordVaultDigest.hex(local)
+        metadata.lastObservedRemoteDigest = PasswordVaultDigest.hex(remote)
+        let fixture = try makeSyncServiceFixture(metadata: metadata, localData: local)
+        fixture.cloud.snapshot = PasswordVaultCloudSnapshot(
+            data: remote,
+            digest: PasswordVaultDigest.hex(remote)
+        )
+        var checkingNotifications = 0
+        let observer = fixture.service.addObserver { snapshot in
+            guard snapshot.phase == .syncing(.checking) else { return }
+            checkingNotifications += 1
+            // The first delivery is the initial snapshot; the next starts the first actual sync.
+            guard checkingNotifications == 2 else { return }
+            for _ in 0..<20 {
+                fixture.service.synchronize(reason: .manual)
+            }
+        }
+        defer { fixture.service.removeObserver(observer) }
+
+        fixture.service.synchronize(reason: .manual)
+        fixture.drain()
+        // The active run may schedule its one follow-up behind the first queue barrier.
+        fixture.drain()
+
+        #expect(fixture.cloud.readCount == 2)
+        #expect(fixture.cloud.writes.isEmpty)
+        #expect(fixture.access.mergeCount == 0)
+        #expect(fixture.service.snapshot.phase == .synced)
+    }
+
     @Test("remote-only change waits for unlock without modifying either replica")
     func remoteChangeWaitsForUnlock() throws {
         let local = Data("local".utf8)

@@ -481,6 +481,7 @@ final class SyncCoordinator {
     private var passwordVaultSyncObserverIdentifier: UUID?
     private var observedOneDriveProcessStatusService: OneDriveProcessStatusServicing?
     private var oneDriveProcessStatusObservation: OneDriveProcessStatusObservation?
+    private var lastOneDriveIsRunning: Bool?
     private var pendingVaultSyncWorkItem: DispatchWorkItem?
     private var lastPasswordVaultSyncSnapshot: PasswordVaultSyncSnapshot?
     private var isStarted = false
@@ -568,6 +569,7 @@ final class SyncCoordinator {
         oneDriveProcessStatusObservation?.cancel()
         oneDriveProcessStatusObservation = nil
         observedOneDriveProcessStatusService = nil
+        lastOneDriveIsRunning = nil
         activationSignature = nil
         isStarted = false
     }
@@ -760,16 +762,22 @@ final class SyncCoordinator {
         guard observedOneDriveProcessStatusService !== service else { return }
         oneDriveProcessStatusObservation?.cancel()
         observedOneDriveProcessStatusService = service
+        lastOneDriveIsRunning = service.currentStatus().isRunning
         oneDriveProcessStatusObservation = service.startMonitoring { [weak self, weak service] in
             guard let self, let service else { return }
+            let isRunning = service.currentStatus().isRunning
             _ = self.synchronizePasswordVaultIfEnabled(reason: .startup)
             self.queue.async { [weak self, weak service] in
                 guard let self,
                       let service,
                       self.isStarted,
                       self.observedOneDriveProcessStatusService === service else { return }
+                let didReconnect = self.lastOneDriveIsRunning == false && isRunning
+                self.lastOneDriveIsRunning = isRunning
                 self.bindPasswordVaultSyncObservation()
                 self.applyConfiguration()
+                // FileProvider process changes can occur while OneDrive stays running.
+                guard didReconnect else { return }
                 let vaultSyncEnabled = self.passwordVaultSyncServiceProvider().snapshot.mode == .oneDrive
                 self.performGenericSync(reason: .startup, vaultSyncEnabled: vaultSyncEnabled)
             }

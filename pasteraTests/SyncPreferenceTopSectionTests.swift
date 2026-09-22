@@ -557,6 +557,91 @@ extension SyncPreferenceTopSectionTests {
         }
     }
 
+    @Test(arguments: [
+        PasswordVaultSyncFailure.remoteCredentialsRequired,
+        PasswordVaultSyncFailure.remoteUnavailable
+    ])
+    func passwordVaultSummaryShowsSpecificFailureDetails(failure: PasswordVaultSyncFailure) throws {
+        try withPreservedSyncDefaults {
+            let controller = CPYSyncPreferenceViewController(
+                defaultFolderResolutionProvider: { .notFound },
+                passwordVaultSyncSnapshotProvider: {
+                    PasswordVaultSyncSnapshot(
+                        mode: .oneDrive,
+                        phase: .failed(failure),
+                        localVaultAvailable: true,
+                        remoteVaultAvailable: true,
+                        pendingChangeCount: 2,
+                        conflictCopyCount: 0,
+                        lastSyncAt: nil
+                    )
+                }
+            )
+            controller.loadView()
+            controller.viewDidLoad()
+            controller.view.layoutSubtreeIfNeeded()
+
+            let texts = Set(preferenceTextFieldFrames(in: controller.view).map(\.text))
+            #expect(texts.contains(passwordVaultSyncFailureMessage(failure)))
+        }
+    }
+
+    @Test
+    func visiblePasswordVaultSummaryUpdatesWhenSyncRecovers() throws {
+        let syncService = SyncPreferencePasswordVaultSyncService()
+        AppEnvironment.push(passwordVaultSyncService: syncService)
+        defer { AppEnvironment.popLast() }
+
+        try withPreservedSyncDefaults {
+            let controller = CPYSyncPreferenceViewController(
+                defaultFolderResolutionProvider: { .notFound },
+                oneDriveProcessStatusService: SyncPreferenceOneDriveProcessStatusService()
+            )
+            let window = SyncTopSectionVisibilityWindow()
+            window.contentView = controller.view
+            window.testIsVisible = true
+            defer { window.contentView = nil }
+            controller.view.layoutSubtreeIfNeeded()
+            let failureMessage = passwordVaultSyncFailureMessage(.remoteUnavailable)
+            let initialTexts = Set(preferenceTextFieldFrames(in: controller.view).map(\.text))
+            #expect(initialTexts.contains(failureMessage))
+
+            syncService.publish(phase: .synced)
+            controller.view.layoutSubtreeIfNeeded()
+
+            let updatedTexts = Set(preferenceTextFieldFrames(in: controller.view).map(\.text))
+            #expect(updatedTexts.contains(pasteraPreferenceString("OneDrive is connected")))
+            #expect(!updatedTexts.contains(failureMessage))
+        }
+    }
+
+    @Test
+    func passwordVaultSummaryObservationIsReplacedOnReloadAndRemovedOnDeinit() throws {
+        let syncService = SyncPreferencePasswordVaultSyncService()
+        AppEnvironment.push(passwordVaultSyncService: syncService)
+        defer { AppEnvironment.popLast() }
+
+        try withPreservedSyncDefaults {
+            weak var releasedController: CPYSyncPreferenceViewController?
+            let initialObserverCount = syncService.observerCount
+            autoreleasepool {
+                let controller = CPYSyncPreferenceViewController(
+                    defaultFolderResolutionProvider: { .notFound },
+                    oneDriveProcessStatusService: SyncPreferenceOneDriveProcessStatusService()
+                )
+                releasedController = controller
+                for _ in 0..<3 {
+                    controller.loadView()
+                    controller.viewDidLoad()
+                    #expect(syncService.observerCount == initialObserverCount + 1)
+                }
+            }
+
+            #expect(releasedController == nil)
+            #expect(syncService.observerCount == initialObserverCount)
+        }
+    }
+
     @Test
     func passwordVaultSummaryShowsLastVerifiedSyncTime() throws {
         try withPreservedSyncDefaults {
@@ -639,6 +724,56 @@ extension SyncPreferenceTopSectionTests {
 
             #expect(enabledRootURL == syncRootURL.standardizedFileURL)
         }
+    }
+}
+
+private final class SyncPreferencePasswordVaultSyncService: PasswordVaultSyncControlling {
+    private(set) var snapshot = PasswordVaultSyncSnapshot(
+        mode: .oneDrive,
+        phase: .failed(.remoteUnavailable),
+        localVaultAvailable: true,
+        remoteVaultAvailable: true,
+        pendingChangeCount: 2,
+        conflictCopyCount: 0,
+        lastSyncAt: nil
+    )
+    private var observers = [UUID: (PasswordVaultSyncSnapshot) -> Void]()
+
+    var observerCount: Int { observers.count }
+
+    func addObserver(_ observer: @escaping (PasswordVaultSyncSnapshot) -> Void) -> UUID {
+        let identifier = UUID()
+        observers[identifier] = observer
+        observer(snapshot)
+        return identifier
+    }
+
+    func removeObserver(_ identifier: UUID) {
+        observers.removeValue(forKey: identifier)
+    }
+
+    func record(_: PasswordVaultCommit) {}
+    func synchronize(reason _: SyncCoordinator.Reason) {}
+
+    func enableOneDrive(
+        rootURL _: URL,
+        remoteMasterPassword _: String?, // swiftlint:disable:this inclusive_language
+        completion: @escaping (Result<Void, PasswordVaultSyncFailure>) -> Void
+    ) {
+        completion(.success(()))
+    }
+
+    func publish(phase: PasswordVaultSyncPhase) {
+        snapshot = PasswordVaultSyncSnapshot(
+            mode: .oneDrive,
+            phase: phase,
+            localVaultAvailable: true,
+            remoteVaultAvailable: true,
+            pendingChangeCount: 0,
+            conflictCopyCount: 0,
+            lastSyncAt: nil
+        )
+        Array(observers.values).forEach { $0(snapshot) }
     }
 }
 

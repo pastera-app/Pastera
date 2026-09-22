@@ -52,6 +52,7 @@ final class PasswordVaultSyncService: PasswordVaultSyncControlling {
     private var metadata: PasswordVaultSyncMetadata
     private var currentSnapshot: PasswordVaultSyncSnapshot
     private var observers = [UUID: (PasswordVaultSyncSnapshot) -> Void]()
+    private var hasQueuedSynchronization = false
 
     init(
         access: PasswordVaultSyncAccess,
@@ -114,8 +115,17 @@ extension PasswordVaultSyncService {
     }
 
     func synchronize(reason: SyncCoordinator.Reason) {
+        let shouldEnqueue = stateLock.withLock {
+            guard !hasQueuedSynchronization else { return false }
+            hasQueuedSynchronization = true
+            return true
+        }
+        guard shouldEnqueue else { return }
         queue.async { [weak self] in
-            self?.synchronizeOnQueue(remotePassword: nil, completion: nil)
+            guard let self else { return }
+            // Keep at most one follow-up while cloud I/O occupies the shared vault queue.
+            self.stateLock.withLock { self.hasQueuedSynchronization = false }
+            self.synchronizeOnQueue(remotePassword: nil, completion: nil)
         }
     }
 

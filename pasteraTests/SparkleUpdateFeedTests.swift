@@ -25,8 +25,8 @@ struct SparkleUpdateFeedTests {
         let shortVersion = try infoPlistValue(forKey: "CFBundleShortVersionString")
         let buildVersion = try infoPlistValue(forKey: "CFBundleVersion")
 
-        #expect(shortVersion == "3.0.4")
-        #expect(buildVersion == "304")
+        #expect(shortVersion == "3.0.5")
+        #expect(buildVersion == "305")
         #expect(shortVersion.wholeMatch(of: /[0-9]+(?:\.[0-9]+)*/) != nil)
         #expect(buildVersion.wholeMatch(of: /[0-9]+/) != nil)
     }

@@ -1159,6 +1159,104 @@ struct SyncCoordinatorTests {
     }
 
     @Test
+    func coordinatorIgnoresOneDriveRuntimeChangesWhileStillRunning() throws {
+        let rootURL = try makeRootURL()
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let processStatus = CoordinatorOneDriveProcessStatusService()
+        let vaultSync = CoordinatorPasswordVaultSyncController(snapshot: makeVaultSnapshot(mode: .localOnly))
+        let coordinatorQueue = DispatchQueue(label: "Pastera.SyncCoordinatorTests.runtimeChanges")
+        var providerConstructionCount = 0
+        let coordinator = SyncCoordinator(
+            settingsProvider: { makeSettings(rootURL: rootURL, snippetUpload: true) },
+            providerFactory: { url in
+                providerConstructionCount += 1
+                return OneDriveFolderSyncProvider(rootURL: url)
+            },
+            historyRepository: historyRepository,
+            snippetRepository: SyncSnippetRepository(),
+            passwordVaultSyncServiceProvider: { vaultSync },
+            oneDriveProcessStatusServiceProvider: { processStatus },
+            queue: coordinatorQueue
+        )
+        coordinator.start()
+        defer { coordinator.stop() }
+        #expect(coordinatorQueue.sync { providerConstructionCount } == 1)
+
+        for _ in 0..<20 {
+            processStatus.sendLifecycleChange()
+        }
+
+        #expect(coordinatorQueue.sync { providerConstructionCount } == 1)
+    }
+
+    @Test
+    func coordinatorDoesNotSyncGenericDataWhenOneDriveDisconnects() throws {
+        let rootURL = try makeRootURL()
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let processStatus = CoordinatorOneDriveProcessStatusService()
+        let vaultSync = CoordinatorPasswordVaultSyncController(snapshot: makeVaultSnapshot(mode: .localOnly))
+        let coordinatorQueue = DispatchQueue(label: "Pastera.SyncCoordinatorTests.disconnect")
+        var providerConstructionCount = 0
+        let coordinator = SyncCoordinator(
+            settingsProvider: { makeSettings(rootURL: rootURL, snippetUpload: true) },
+            providerFactory: { url in
+                providerConstructionCount += 1
+                return OneDriveFolderSyncProvider(rootURL: url)
+            },
+            historyRepository: historyRepository,
+            snippetRepository: SyncSnippetRepository(),
+            passwordVaultSyncServiceProvider: { vaultSync },
+            oneDriveProcessStatusServiceProvider: { processStatus },
+            queue: coordinatorQueue
+        )
+        coordinator.start()
+        defer { coordinator.stop() }
+        #expect(coordinatorQueue.sync { providerConstructionCount } == 1)
+
+        processStatus.setStatus(.notRunning(appURL: URL(fileURLWithPath: "/Applications/OneDrive.app")))
+        processStatus.sendLifecycleChange()
+
+        #expect(coordinatorQueue.sync { providerConstructionCount } == 1)
+    }
+
+    @Test
+    func coordinatorSyncsGenericDataOnceWhenOneDriveReconnects() throws {
+        let rootURL = try makeRootURL()
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let processStatus = CoordinatorOneDriveProcessStatusService()
+        let vaultSync = CoordinatorPasswordVaultSyncController(snapshot: makeVaultSnapshot(mode: .localOnly))
+        let coordinatorQueue = DispatchQueue(label: "Pastera.SyncCoordinatorTests.reconnect")
+        var providerConstructionCount = 0
+        let coordinator = SyncCoordinator(
+            settingsProvider: { makeSettings(rootURL: rootURL, snippetUpload: true) },
+            providerFactory: { url in
+                providerConstructionCount += 1
+                return OneDriveFolderSyncProvider(rootURL: url)
+            },
+            historyRepository: historyRepository,
+            snippetRepository: SyncSnippetRepository(),
+            passwordVaultSyncServiceProvider: { vaultSync },
+            oneDriveProcessStatusServiceProvider: { processStatus },
+            queue: coordinatorQueue
+        )
+        coordinator.start()
+        defer { coordinator.stop() }
+        #expect(coordinatorQueue.sync { providerConstructionCount } == 1)
+
+        let appURL = URL(fileURLWithPath: "/Applications/OneDrive.app")
+        processStatus.setStatus(.notRunning(appURL: appURL))
+        processStatus.sendLifecycleChange()
+        #expect(coordinatorQueue.sync { providerConstructionCount } == 1)
+
+        processStatus.setStatus(.running(appURL: appURL))
+        for _ in 0..<20 {
+            processStatus.sendLifecycleChange()
+        }
+
+        #expect(coordinatorQueue.sync { providerConstructionCount } == 2)
+    }
+
+    @Test
     func coordinatorRebindsDynamicVaultServiceWhenOneDriveLifecycleChanges() throws {
         let rootURL = try makeRootURL()
         defer { try? FileManager.default.removeItem(at: rootURL) }
@@ -1405,12 +1503,17 @@ private final class CoordinatorPasswordVaultSyncController: PasswordVaultSyncCon
 private final class CoordinatorOneDriveProcessStatusService: OneDriveProcessStatusServicing {
     private let lock = NSLock()
     private var onChange: (() -> Void)?
+    private var status = OneDriveProcessStatus.running(appURL: URL(fileURLWithPath: "/Applications/OneDrive.app"))
 
     func currentStatus() -> OneDriveProcessStatus {
-        .running(appURL: URL(fileURLWithPath: "/Applications/OneDrive.app"))
+        lock.withLock { status }
     }
 
-    func isMainApplicationRunning() -> Bool { true }
+    func isMainApplicationRunning() -> Bool { currentStatus().isRunning }
+
+    func setStatus(_ status: OneDriveProcessStatus) {
+        lock.withLock { self.status = status }
+    }
 
     func openOneDrive() -> Bool { true }
 

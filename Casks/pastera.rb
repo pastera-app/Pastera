@@ -1,6 +1,6 @@
 cask "pastera" do
-  version "3.0.4-beta"
-  sha256 "7bbfca96665925aa07ba756cdcbc5527b6575ea479d32ab05ddb5fcf98072b4d"
+  version "3.0.5-beta"
+  sha256 "5ffae9018d629c7f345154dc23fb5c0fcd8b9da2925f61c93e5de93636ccbe9f"
 
   url "https://github.com/pastera-app/Pastera/releases/download/v#{version}/Pastera-#{version}-macOS.dmg",
       verified: "github.com/pastera-app/Pastera/"

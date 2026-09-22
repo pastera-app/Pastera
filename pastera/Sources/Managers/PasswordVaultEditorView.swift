@@ -396,6 +396,8 @@ final class PasswordVaultFolderEditorView: NSView {
     private let onSave: (String) -> Void
     private let onCancel: () -> Void
 
+    var draftName: String { field.stringValue }
+
     init(name: String, onSave: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
         self.onSave = onSave
         self.onCancel = onCancel

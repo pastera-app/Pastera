@@ -711,6 +711,38 @@ struct MainMenuOneDriveStatusAssetTests {
 @MainActor
 @Suite(.serialized)
 struct MainMenuFooterButtonActionTests {
+    @Test(arguments: ["mainMenuOneDriveStatusButton", "mainMenuPreferencesButton"])
+    func pinnedMainMenuHidesBeforeOpeningSettingsFromFooter(buttonIdentifier: String) {
+        let oneDriveService = MainMenuFakeOneDriveProcessStatusService(status: .running(
+            appURL: URL(fileURLWithPath: "/Applications/OneDrive.app")
+        ))
+        weak var presentedController: MainMenuPanelController?
+        var panelWasVisibleWhenSettingsOpened: Bool?
+        let openSettings = {
+            panelWasVisibleWhenSettingsOpened = presentedController?.isVisibleForTesting
+        }
+        let controller = MainMenuPanelController(
+            historyTitle: "History",
+            historyImage: nil,
+            snippetTitle: "Snippet",
+            snippetImage: nil,
+            itemsProvider: { [] },
+            onOpenHistory: {},
+            onOpenSnippets: {},
+            oneDriveStatusService: oneDriveService,
+            onOpenPreferences: openSettings,
+            onOpenOneDriveStatus: openSettings
+        )
+        presentedController = controller
+        controller.show(at: NSPoint(x: 180, y: 700), pinned: true)
+        defer { controller.close() }
+        #expect(controller.isVisibleForTesting)
+
+        controller.performMainMenuButtonClickForTesting(identifier: buttonIdentifier)
+
+        #expect(panelWasVisibleWhenSettingsOpened == false)
+    }
+
     @Test
     func mainMenuFooterOneDriveStatusStartsInstalledOneDriveWithoutNavigating() {
         let oneDriveService = MainMenuFakeOneDriveProcessStatusService(status: .notRunning(

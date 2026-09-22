@@ -148,6 +148,7 @@ private final class PasteraVaultSyncSummaryView: NSStackView {
         detailLabel.stringValue = detail ?? ""
         detailLabel.isHidden = detail == nil
         let accessibilityText = detail.map { "\(text), \($0)" } ?? text
+        toolTip = accessibilityText
         setAccessibilityLabel(accessibilityText)
     }
 }
@@ -189,6 +190,8 @@ final class CPYSyncPreferenceViewController: PasteraPreferencePageViewController
     }
 
     private let settingsStore = UserDefaultsSyncSettingsStore()
+    private let passwordVaultSyncService = AppEnvironment.current.passwordVaultSyncService
+    private var passwordVaultSyncObserver: UUID?
     private var syncActivityObserver: NSObjectProtocol?
     private var activationObserver: NSObjectProtocol?
     private var oneDriveProcessStatusObservation: OneDriveProcessStatusObservation?
@@ -316,6 +319,17 @@ final class CPYSyncPreferenceViewController: PasteraPreferencePageViewController
         oneDriveProcessStatusObservation = oneDriveProcessStatusService.startMonitoring { [weak self] in
             guard let self, self.isViewLoaded, self.view.window?.isVisible == true else { return }
             self.refreshDefaultFolderAvailability()
+        }
+        passwordVaultSyncObserver = passwordVaultSyncService.addObserver { [weak self] _ in
+            let refresh: () -> Void = { [weak self] in
+                guard let self, self.isViewLoaded else { return }
+                self.updatePasswordVaultSyncSummary()
+            }
+            if Thread.isMainThread {
+                refresh()
+            } else {
+                DispatchQueue.main.async(execute: refresh)
+            }
         }
     }
 
@@ -459,6 +473,10 @@ final class CPYSyncPreferenceViewController: PasteraPreferencePageViewController
     }
 
     private func removeObservers() {
+        if let passwordVaultSyncObserver {
+            passwordVaultSyncService.removeObserver(passwordVaultSyncObserver)
+            self.passwordVaultSyncObserver = nil
+        }
         oneDriveProcessStatusObservation?.cancel()
         oneDriveProcessStatusObservation = nil
         if let syncActivityObserver {
@@ -650,10 +668,9 @@ private extension CPYSyncPreferenceViewController {
 
     func updatePasswordVaultSyncSummary() {
         let snapshot = passwordVaultSyncSnapshotProvider()
-        let rootIsAvailable = settingsStore.settings().rootURL.map(isSyncRootAvailable) ?? false
         enableVaultSyncButton.isHidden = snapshot.mode == .oneDrive
         enableVaultSyncButton.isEnabled = snapshot.mode == .localOnly
-            && rootIsAvailable
+            && (settingsStore.settings().rootURL.map(isSyncRootAvailable) ?? false)
         let presentation = passwordVaultSyncPresentation(for: snapshot)
         vaultSyncSummaryView.update(
             text: presentation.text,
@@ -733,7 +750,14 @@ private extension CPYSyncPreferenceViewController {
                 symbolName: "exclamationmark.triangle.fill",
                 tintColor: .systemOrange
             )
-        case .failed, .disabled:
+        case .failed(let failure):
+            return PasteraVaultSyncPresentation(
+                text: passwordVaultSyncFailureMessage(failure),
+                detail: pendingDetail,
+                symbolName: "xmark.octagon.fill",
+                tintColor: .systemRed
+            )
+        case .disabled:
             return PasteraVaultSyncPresentation(
                 text: pasteraPreferenceString("OneDrive sync needs attention"),
                 detail: pendingDetail,

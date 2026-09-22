@@ -372,8 +372,8 @@ final class MainMenuPanelController: NSObject, NSWindowDelegate, NSSearchFieldDe
     }
 
     private enum PasswordVaultFolderEditorState {
-        case create(error: String?)
-        case rename(PasswordVaultFolder, error: String?)
+        case create(draftName: String, error: String?)
+        case rename(PasswordVaultFolder, draftName: String, error: String?)
     }
 
     private enum PasswordVaultPendingDeletion: Equatable {
@@ -420,6 +420,7 @@ final class MainMenuPanelController: NSObject, NSWindowDelegate, NSSearchFieldDe
     private var passwordVaultEditorState: PasswordVaultEditorState?
     private var passwordVaultStepEditorView: PasswordVaultStepEditorView?
     private var passwordVaultFolderEditorState: PasswordVaultFolderEditorState?
+    private weak var passwordVaultFolderEditorView: PasswordVaultFolderEditorView?
     private var passwordVaultStatusMessage: String?
     private var passwordVaultPendingDeletion: PasswordVaultPendingDeletion?
     private var passwordVaultAccessError: String?
@@ -556,6 +557,7 @@ final class MainMenuPanelController: NSObject, NSWindowDelegate, NSSearchFieldDe
     @discardableResult
     func close() -> Bool {
         guard commitInlineEditorFromCurrentDraft() else { return false }
+        preservePasswordVaultEditorDrafts()
         searchQueryChangeTimer?.invalidate()
         searchQueryChangeTimer = nil
         keepsVisibleWhileChildPanelOpen = false
@@ -1862,11 +1864,11 @@ extension MainMenuPanelController {
                     rowKind: .snippetFolder,
                     showsChevron: true,
                     isExpanded: isExpanded,
-                    onEdit: { [weak self] in self?.passwordVaultFolderEditorState = .rename(folder, error: nil); self?.reloadContentKeepingTopLeft() },
+                    onEdit: { [weak self] in self?.passwordVaultFolderEditorState = .rename(folder, draftName: folder.name, error: nil); self?.reloadContentKeepingTopLeft() },
                     showsEditButton: false,
                     onDelete: { [weak self] in self?.deletePasswordVaultFolder(folder.id) },
                     onDoubleClick: isWorkspaceEditing ? { [weak self] in
-                            self?.passwordVaultFolderEditorState = .rename(folder, error: nil)
+                            self?.passwordVaultFolderEditorState = .rename(folder, draftName: folder.name, error: nil)
                             self?.reloadContentKeepingTopLeft()
                         } : nil,
                     dragIdentifier: isWorkspaceEditing ? "password-folder:\(folder.id.uuidString)" : nil,
@@ -1884,7 +1886,7 @@ extension MainMenuPanelController {
             )
             let folderRows: [EmbeddedRow]
             if let passwordVaultFolderEditorState,
-               case let .rename(editingFolder, _) = passwordVaultFolderEditorState,
+               case let .rename(editingFolder, _, _) = passwordVaultFolderEditorState,
                editingFolder.id == folder.id {
                 folderRows = makePasswordVaultFolderEditorContent(passwordVaultFolderEditorState).rows
             } else {
@@ -2413,14 +2415,15 @@ extension MainMenuPanelController {
         let name: String
         let error: String?
         switch state {
-        case let .create(message): (name, error) = ("", message)
-        case let .rename(folder, message): (name, error) = (folder.name, message)
+        case let .create(draftName, message): (name, error) = (draftName, message)
+        case let .rename(_, draftName, message): (name, error) = (draftName, message)
         }
         let editor = PasswordVaultFolderEditorView(
             name: name,
             onSave: { [weak self] name in self?.savePasswordVaultFolder(name: name) },
             onCancel: { [weak self] in self?.passwordVaultFolderEditorState = nil; self?.reloadContentKeepingTopLeft() }
         )
+        passwordVaultFolderEditorView = editor
         let rows = error.map { [emptyRow(title: $0), EmbeddedRow(title: String(localized: "Folder"), view: editor, confirm: {})] }
             ?? [EmbeddedRow(title: String(localized: "Folder"), view: editor, confirm: {})]
         return EmbeddedContent(
@@ -2533,12 +2536,42 @@ extension MainMenuPanelController {
     private func setPasswordVaultEditorState(
         entryID: PasswordVaultEntry.ID?,
         draft: PasswordVaultDraft,
-        step: PasswordVaultEditorStep
+        step: PasswordVaultEditorStep,
+        error: String? = nil
     ) {
         if let entryID {
-            passwordVaultEditorState = .edit(entryID, draft, step: step, error: nil)
+            passwordVaultEditorState = .edit(entryID, draft, step: step, error: error)
         } else {
-            passwordVaultEditorState = .create(draft, step: step, error: nil)
+            passwordVaultEditorState = .create(draft, step: step, error: error)
+        }
+    }
+
+    private func preservePasswordVaultEditorDrafts() {
+        if let state = passwordVaultEditorState, let editor = passwordVaultStepEditorView {
+            var draft: PasswordVaultDraft
+            let step: PasswordVaultEditorStep
+            let entryID: PasswordVaultEntry.ID?
+            let error: String?
+            switch state {
+            case let .create(value, currentStep, message):
+                (draft, step, entryID, error) = (value, currentStep, nil, message)
+            case let .edit(id, value, currentStep, message):
+                (draft, step, entryID, error) = (value, currentStep, id, message)
+            }
+            switch step {
+            case .title: draft.title = editor.value
+            case .username: draft.username = editor.value
+            case .password: draft.password = editor.value
+            }
+            setPasswordVaultEditorState(entryID: entryID, draft: draft, step: step, error: error)
+        }
+        if let state = passwordVaultFolderEditorState, let editor = passwordVaultFolderEditorView {
+            switch state {
+            case let .create(_, error):
+                passwordVaultFolderEditorState = .create(draftName: editor.draftName, error: error)
+            case let .rename(folder, _, error):
+                passwordVaultFolderEditorState = .rename(folder, draftName: editor.draftName, error: error)
+            }
         }
     }
 
@@ -2639,7 +2672,7 @@ extension MainMenuPanelController {
     }
 
     private func beginCreatingPasswordVaultFolder() {
-        passwordVaultFolderEditorState = .create(error: nil)
+        passwordVaultFolderEditorState = .create(draftName: "", error: nil)
         reloadContentKeepingTopLeft()
     }
 
@@ -2649,7 +2682,7 @@ extension MainMenuPanelController {
             passwordVaultDataSource?.createFolder(name) { [weak self] result in
                 self?.finishPasswordVaultFolderSave(result)
             }
-        case let .rename(folder, _):
+        case let .rename(folder, _, _):
             passwordVaultDataSource?.renameFolder(folder.id, name) { [weak self] result in
                 self?.finishPasswordVaultFolderSave(result)
             }
@@ -2665,10 +2698,10 @@ extension MainMenuPanelController {
             passwordVaultFolderEditorState = nil
         case let .failure(error):
             switch passwordVaultFolderEditorState {
-            case .create:
-                passwordVaultFolderEditorState = .create(error: passwordVaultMessage(error))
-            case let .rename(folder, _):
-                passwordVaultFolderEditorState = .rename(folder, error: passwordVaultMessage(error))
+            case let .create(draftName, _):
+                passwordVaultFolderEditorState = .create(draftName: draftName, error: passwordVaultMessage(error))
+            case let .rename(folder, draftName, _):
+                passwordVaultFolderEditorState = .rename(folder, draftName: draftName, error: passwordVaultMessage(error))
             case nil:
                 break
             }
@@ -2975,7 +3008,10 @@ extension MainMenuPanelController {
                 onSnippets: { [weak self] in self?.openSnippetsFromToolbar() },
                 onPasswordVault: { [weak self] in self?.openPasswordVaultFromToolbar() },
                 onOneDrive: { [weak self] in self?.openOneDriveFromToolbar() },
-                onPreferences: { [weak self] in self?.onOpenPreferences() }
+                onPreferences: { [weak self] in
+                    guard let self, self.close() else { return }
+                    self.onOpenPreferences()
+                }
             )
         )
         contentView.addSubview(toolbar)
@@ -3275,6 +3311,7 @@ extension MainMenuPanelController {
         switch oneDriveStatusService.currentStatus() {
         case .running:
             if oneDriveStatusService.isMainApplicationRunning() {
+                guard close() else { return }
                 onOpenOneDriveStatus()
             } else {
                 _ = oneDriveStatusService.openOneDrive()

@@ -19,15 +19,14 @@ macOS 应用是当前可运行的产品基线。原生 Windows 客户端将在�
 
 ## 下载
 
-[下载当前 Beta](https://github.com/pastera-app/Pastera/releases/tag/v3.0.4-beta) 或 [查看全部 Releases](https://github.com/pastera-app/Pastera/releases)。
+[下载当前 Beta](https://github.com/pastera-app/Pastera/releases/tag/v3.0.5-beta) 或 [查看全部 Releases](https://github.com/pastera-app/Pastera/releases)。
 
-### 当前版本：3.0.4-beta
+### 当前版本：3.0.5-beta
 
-- 修复旧版更新下载入口：重新检查更新后，可点击“查看更多”通过浏览器下载官方 DMG。
-- 修复 OneDrive 历史快照暂时不可读后不再重试的问题，恢复后可继续导入其他设备的复制记录。
-- 同步恢复成功后刷新失败状态，并提示仍待重试的历史快照。
-- 读取云端协议文件失败时保留历史快照，避免将临时读取故障误判为旧协议并清理数据。
-- 密码箱支持通过数字键快捷粘贴密码和账户。
+- 避免 OneDrive 状态未变化时重复触发同步。
+- 合并密码箱的重复同步请求，避免连续点击或系统事件积累云端读写任务。
+- 同步状态及时显示最新的具体错误，避免旧错误残留。
+- 修复从主菜单打开设置时的窗口遮挡。
 
 系统要求：macOS 15 Sequoia 或更高版本。
 

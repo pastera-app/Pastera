@@ -1018,6 +1018,134 @@ struct PasswordVaultMenuTests {
         )
     }
 
+    @Test("footer settings navigation preserves unfinished password fields", arguments: [
+        "mainMenuOneDriveStatusButton", "mainMenuPreferencesButton"
+    ], ["title", "username", "password"])
+    func footerSettingsNavigationPreservesUncommittedVaultFields(buttonIdentifier: String, step: String) throws {
+        let folderID = UUID()
+        var savedDraft: PasswordVaultDraft?
+        var settingsOpened = false
+        let controller = MainMenuPanelController(
+            historyTitle: "History", historyImage: nil, snippetTitle: "Snippet", snippetImage: nil,
+            itemsProvider: { [] }, onOpenHistory: {}, onOpenSnippets: {},
+            passwordVaultDataSource: MainMenuPasswordVaultDataSource(
+                fetchFolders: { [PasswordVaultFolder(id: folderID, name: "Work", createdAt: .distantPast, updatedAt: .distantPast)] },
+                fetchEntries: { [] },
+                copyPassword: { _, completion in completion(.success(())) },
+                loadDraft: { _, completion in completion(.failure(.entryNotFound)) },
+                createEntry: { draft, completion in savedDraft = draft; completion(.success(())) },
+                updateEntry: { _, _, completion in completion(.success(())) },
+                deleteEntry: { _, completion in completion(.success(())) },
+                createFolder: { _ in throw PasswordVaultError.keychainUnavailable },
+                renameFolder: { _, _ in throw PasswordVaultError.keychainUnavailable },
+                deleteFolder: { _ in }
+            ),
+            oneDriveStatusService: PasswordVaultMenuOneDriveProcessStatusService(status: .running(
+                appURL: URL(fileURLWithPath: "/Applications/OneDrive.app")
+            )),
+            onOpenPreferences: { settingsOpened = true },
+            onOpenOneDriveStatus: { settingsOpened = true }
+        )
+        controller.openPasswordVaultFromMainMenu()
+        controller.show(at: NSPoint(x: 200, y: 200), pinned: true)
+        defer { _ = controller.close() }
+        controller.toggleWorkspaceEditingForTesting()
+        controller.performMainMenuRowConfirmForTesting(title: "Work")
+        controller.beginCreatingPasswordVaultEntryForTesting(in: folderID)
+        try #require(controller.passwordVaultEditorStepForTesting == "title")
+        if step != "title" {
+            controller.updatePasswordVaultStepValueForTesting("Unfinished mail title")
+            controller.commitPasswordVaultStepForTesting()
+        }
+        if step == "password" {
+            controller.updatePasswordVaultStepValueForTesting("alice")
+            controller.commitPasswordVaultStepForTesting()
+        }
+        let unfinishedValue = switch step {
+        case "title": "Unfinished mail title"
+        case "username": "alice"
+        default: "test-secret"
+        }
+        controller.updatePasswordVaultStepValueForTesting(unfinishedValue)
+
+        controller.performMainMenuButtonClickForTesting(identifier: buttonIdentifier)
+        #expect(settingsOpened)
+        #expect(!controller.isVisibleForTesting)
+        controller.show(at: NSPoint(x: 200, y: 200), pinned: true)
+        #expect(savedDraft == nil)
+        try #require(controller.passwordVaultEditorStepForTesting == step)
+        controller.commitPasswordVaultStepForTesting()
+
+        if step == "title" {
+            try #require(controller.passwordVaultEditorStepForTesting == "username")
+            controller.updatePasswordVaultStepValueForTesting("alice")
+            controller.commitPasswordVaultStepForTesting()
+        }
+        if step != "password" {
+            try #require(controller.passwordVaultEditorStepForTesting == "password")
+            controller.updatePasswordVaultStepValueForTesting("test-secret")
+            controller.commitPasswordVaultStepForTesting()
+        }
+        #expect(savedDraft?.title == "Unfinished mail title")
+        #expect(savedDraft?.username == "alice")
+        #expect(savedDraft?.password == "test-secret")
+    }
+
+    @Test("footer settings navigation preserves an unfinished folder name", arguments: [
+        "mainMenuOneDriveStatusButton", "mainMenuPreferencesButton"
+    ], [false, true])
+    func footerSettingsNavigationPreservesUncommittedFolderName(buttonIdentifier: String, renaming: Bool) throws {
+        let folder = PasswordVaultFolder(id: UUID(), name: "Work", createdAt: .distantPast, updatedAt: .distantPast)
+        var savedNames = [String]()
+        var settingsOpened = false
+        let controller = MainMenuPanelController(
+            historyTitle: "History", historyImage: nil, snippetTitle: "Snippet", snippetImage: nil,
+            itemsProvider: { [] }, onOpenHistory: {}, onOpenSnippets: {},
+            passwordVaultDataSource: MainMenuPasswordVaultDataSource(
+                fetchFolders: { [folder] }, fetchEntries: { [] },
+                copyPassword: { _, completion in completion(.success(())) },
+                loadDraft: { _, completion in completion(.failure(.entryNotFound)) },
+                createEntry: { _, completion in completion(.success(())) },
+                updateEntry: { _, _, completion in completion(.success(())) },
+                deleteEntry: { _, completion in completion(.success(())) },
+                createFolder: { name in savedNames.append(name); return folder },
+                renameFolder: { _, name in savedNames.append(name); return folder },
+                deleteFolder: { _ in }
+            ),
+            oneDriveStatusService: PasswordVaultMenuOneDriveProcessStatusService(status: .running(
+                appURL: URL(fileURLWithPath: "/Applications/OneDrive.app")
+            )),
+            onOpenPreferences: { settingsOpened = true },
+            onOpenOneDriveStatus: { settingsOpened = true }
+        )
+        controller.openPasswordVaultFromMainMenu()
+        controller.show(at: NSPoint(x: 200, y: 200), pinned: true)
+        defer { _ = controller.close() }
+        if renaming {
+            controller.toggleWorkspaceEditingForTesting()
+            controller.performMainMenuRowDoubleClickForTesting(title: "Work")
+        } else {
+            controller.beginCreatingPasswordVaultFolderForTesting()
+        }
+        let panel = try #require(NSApp.windows.first { $0.delegate === controller })
+        let contentView = try #require(panel.contentView)
+        let editor = try #require(findVaultFolderEditor(in: contentView))
+        let field = try #require(editor.subviews.compactMap { $0 as? PasswordVaultReturnTextField }.first)
+        field.stringValue = "Unfinished folder name"
+
+        controller.performMainMenuButtonClickForTesting(identifier: buttonIdentifier)
+        #expect(settingsOpened)
+        #expect(!controller.isVisibleForTesting)
+        controller.show(at: NSPoint(x: 200, y: 200), pinned: true)
+
+        #expect(savedNames.isEmpty)
+        let restoredEditor = try #require(findVaultFolderEditor(in: contentView))
+        let restoredField = try #require(restoredEditor.subviews.compactMap { $0 as? PasswordVaultReturnTextField }.first)
+        #expect(restoredField.stringValue == "Unfinished folder name")
+        restoredField.keyDown(with: try #require(keyEvent(keyCode: 36, characters: "\r")))
+        #expect(savedNames == ["Unfinished folder name"])
+    }
+
     @Test("password creation stays inside its folder and advances one compact field at a time")
     func passwordCreationUsesFolderScopedSteps() {
         let folderID = UUID()
@@ -1581,6 +1709,15 @@ struct PasswordVaultMenuTests {
             onOpenOneDriveStatus: onOpenOneDriveStatus
         )
     }
+}
+
+@MainActor
+private func findVaultFolderEditor(in view: NSView) -> PasswordVaultFolderEditorView? {
+    if let editor = view as? PasswordVaultFolderEditorView { return editor }
+    for subview in view.subviews {
+        if let editor = findVaultFolderEditor(in: subview) { return editor }
+    }
+    return nil
 }
 
 private func menuSyncDataSource(
