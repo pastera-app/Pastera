@@ -682,13 +682,13 @@ final class OneDriveFolderSyncProvider {
         let histories: [FileDirectoryHistory]
     }
 
-    private struct FileDirectoryHistory: Codable {
+    private struct FileDirectoryHistory: Codable, Equatable {
         let historyID: String
         let updatedAt: Int
         let assets: [FileDirectoryAsset]
     }
 
-    private struct FileDirectoryAsset: Codable {
+    private struct FileDirectoryAsset: Codable, Equatable {
         let assetIndex: Int
         let pasteboardType: String
         let byteCount: Int
@@ -817,6 +817,16 @@ final class OneDriveFolderSyncProvider {
     func saveSnippetSnapshot(_ snapshot: SnippetSyncSnapshot, deviceID: String) throws {
         try removeLegacyV1Paths()
         let destinationURL = snippetDevicesURL.appendingPathComponent(fileName(for: deviceID))
+        if fileManager.fileExists(atPath: destinationURL.path),
+           let existing = try? loadSnippetSnapshot(at: destinationURL), existing.deviceID == deviceID,
+           existing.snapshot.folders.sorted(by: { $0.id < $1.id }) == snapshot.folders.sorted(by: { $0.id < $1.id }),
+           existing.snapshot.snippets.sorted(by: { $0.id < $1.id }) == snapshot.snippets.sorted(by: { $0.id < $1.id }),
+           existing.snapshot.deletedFolders.sorted(by: { $0.id < $1.id })
+            == snapshot.deletedFolders.sorted(by: { $0.id < $1.id }),
+           existing.snapshot.deletedSnippets.sorted(by: { $0.id < $1.id })
+            == snapshot.deletedSnippets.sorted(by: { $0.id < $1.id }) {
+            return
+        }
         try writeSQLiteSnapshot(to: destinationURL) { database in
             try database.execute("""
                 CREATE TABLE metadata (
@@ -935,7 +945,8 @@ final class OneDriveFolderSyncProvider {
         let deviceDirectoryURL = fileDevicesURL.appendingPathComponent(deviceDirectoryName, isDirectory: true)
         try fileManager.createDirectory(at: deviceDirectoryURL, withIntermediateDirectories: true)
 
-        let previousRelativePaths = existingDirectFileRelativePaths(in: deviceDirectoryURL)
+        let previousManifest = existingFileManifest(in: deviceDirectoryURL)
+        let previousRelativePaths = Set(previousManifest?.histories.flatMap { $0.assets.map(\.relativePath) } ?? [])
         var writtenNewRelativePaths = Set<String>()
         do {
             var manifestHistories = [FileDirectoryHistory]()
@@ -988,9 +999,15 @@ final class OneDriveFolderSyncProvider {
                 assetCount: manifestAssetCount,
                 histories: manifestHistories
             )
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            try writeFileDataAtomically(encoder.encode(manifest), to: fileManifestURL(for: deviceID))
+            if previousManifest?.manifestVersion != manifest.manifestVersion
+                || previousManifest?.schemaVersion != manifest.schemaVersion
+                || previousManifest?.deviceID != manifest.deviceID
+                || previousManifest?.assetCount != manifest.assetCount
+                || previousManifest?.histories != manifest.histories {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                try writeFileDataAtomically(encoder.encode(manifest), to: fileManifestURL(for: deviceID))
+            }
             try pruneDirectFileAssets(in: deviceDirectoryURL, keeping: keptRelativePaths)
             try removeLegacyFileDevicePaths(for: deviceID)
         } catch {
@@ -1347,12 +1364,11 @@ final class OneDriveFolderSyncProvider {
         }
     }
 
-    private func existingDirectFileRelativePaths(in deviceDirectoryURL: URL) -> Set<String> {
-        guard let manifestData = try? Data(contentsOf: fileManifestURL(forDeviceDirectory: deviceDirectoryURL)),
-              let manifest = try? JSONDecoder().decode(FileDirectoryManifest.self, from: manifestData) else {
-            return []
+    private func existingFileManifest(in deviceDirectoryURL: URL) -> FileDirectoryManifest? {
+        guard let manifestData = try? Data(contentsOf: fileManifestURL(forDeviceDirectory: deviceDirectoryURL)) else {
+            return nil
         }
-        return Set(manifest.histories.flatMap { $0.assets.map(\.relativePath) })
+        return try? JSONDecoder().decode(FileDirectoryManifest.self, from: manifestData)
     }
 
     private func writeMetadata(_ metadata: [String: String], database: SyncSQLiteDatabase) throws {

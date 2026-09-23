@@ -19,14 +19,17 @@ macOS 应用是当前可运行的产品基线。原生 Windows 客户端将在�
 
 ## 下载
 
-[下载当前 Beta](https://github.com/pastera-app/Pastera/releases/tag/v3.0.6-beta) 或 [查看全部 Releases](https://github.com/pastera-app/Pastera/releases)。
+[下载当前 Beta](https://github.com/pastera-app/Pastera/releases/tag/v3.0.7-beta) 或 [查看全部 Releases](https://github.com/pastera-app/Pastera/releases)。
 
-### 当前版本：3.0.6-beta
+### 当前版本：3.0.7-beta
 
-- 按完整文本合并重复历史展示，同时保留原有富文本格式。
-- 监听 OneDrive 同步目录变化，文件到达本机后及时导入，减少等待轮询。
-- 补齐自动粘贴的 Command 按键事件，修复屏幕共享中只输入 `v` 的发送端缺陷。
-- 调整更新操作入口与后台窗口行为，减少主线程阻塞和重复同步任务。
+- 缩短历史写出等待，连续复制时也会及时写入本地同步快照。
+- OneDrive 同步目录延迟出现或被整体替换后，自动恢复上传与导入。
+- 跳过未变化的片段快照和文件清单，减少无效写入和云端同步负担。
+- 停止同步或切换目录后，取消旧观察器尚未执行的历史上传。
+- 仅上传时保留真实失败状态，避免无关的远端变化显示为同步成功。
+
+跨设备传输仍由 OneDrive 完成，本版不承诺两台 Mac 在 1 秒内送达。
 
 系统要求：macOS 15 Sequoia 或更高版本。
 

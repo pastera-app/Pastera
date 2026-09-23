@@ -433,6 +433,66 @@ struct SyncCoordinatorTests {
     }
 
     @Test
+    func coordinatorPreservesUploadFailureWhenRemoteFileChangesWithoutImportScope() async throws {
+        let rootURL = try makeRootURL()
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        try writeWatchedRemoteHistory(
+            provider: provider,
+            id: PasteboardHistory.ID(rawValue: "upload-only-remote-history"),
+            text: "Remote history", updatedAt: 1
+        )
+        let remoteURL = rootURL.appendingPathComponent("history/devices/remote-device.sqlite")
+        let remoteData = try Data(contentsOf: remoteURL)
+        let coordinatorQueue = DispatchQueue(label: "Pastera.SyncCoordinatorTests.uploadFailure")
+        var settingsReadCount = 0
+        let coordinator = SyncCoordinator(
+            settingsProvider: {
+                settingsReadCount += 1
+                return makeSettings(rootURL: rootURL, historyUpload: true)
+            },
+            providerFactory: { _ in provider },
+            historyRepository: DependencyBoundSyncHistoryRepository(),
+            snippetRepository: SyncSnippetRepository(),
+            passwordVaultSyncServiceProvider: {
+                CoordinatorPasswordVaultSyncController(snapshot: makeVaultSnapshot(mode: .localOnly))
+            },
+            oneDriveProcessStatusServiceProvider: { CoordinatorOneDriveProcessStatusService() },
+            queue: coordinatorQueue
+        )
+        coordinator.start()
+        defer { coordinator.stop() }
+        coordinatorQueue.sync {}
+        let lastSuccessfulSync = try #require(coordinatorQueue.sync { coordinator.status.lastSyncAt })
+
+        try Data(#"{"schemaVersion":99}"#.utf8)
+            .write(to: rootURL.appendingPathComponent("history/protocol.json"), options: .atomic)
+        try FileManager.default.removeItem(
+            at: rootURL.appendingPathComponent("history/devices/\(currentDeviceID).sqlite")
+        )
+        coordinator.syncNow(reason: .manual, wait: true)
+        let failedStatus = coordinatorQueue.sync { coordinator.status }
+        try #require(failedStatus.phase == .failed)
+        try #require(failedStatus.errorDescription != nil)
+        #expect(failedStatus.lastSyncAt == lastSuccessfulSync)
+        let settingsReadsBeforeRemoteChange = coordinatorQueue.sync { settingsReadCount }
+
+        try remoteData.write(to: remoteURL, options: .atomic)
+
+        // Configuration is reread by the real folder callback before its sync pass.
+        let deadline = Date().addingTimeInterval(5)
+        while coordinatorQueue.sync(execute: { settingsReadCount }) == settingsReadsBeforeRemoteChange,
+              Date() < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try #require(coordinatorQueue.sync { settingsReadCount } > settingsReadsBeforeRemoteChange)
+        let statusAfterRemoteChange = coordinatorQueue.sync { coordinator.status }
+        #expect(statusAfterRemoteChange.phase == .failed)
+        #expect(statusAfterRemoteChange.errorDescription == failedStatus.errorDescription)
+        #expect(statusAfterRemoteChange.lastSyncAt == lastSuccessfulSync)
+    }
+
+    @Test
     func coordinatorClearsSkippedStatusAfterSuccessfulAutomaticNoOp() throws {
         let rootURL = try makeRootURL()
         defer { try? FileManager.default.removeItem(at: rootURL) }
@@ -519,6 +579,221 @@ struct SyncCoordinatorTests {
         let imported = try await waitForHistory(in: importedHistory, id: remoteID, text: "After replacement")
         #expect(imported, "A downloaded remote snapshot must import without waiting for the 300-second timer")
         #expect(try FileManager.default.attributesOfItem(atPath: snippetURL.path)[.modificationDate] as? Date == uploadedAt)
+    }
+
+    @Test(arguments: [false, true])
+    func coordinatorExportsNewHistoryPromptlyDuringContinuousChanges(continuousChanges: Bool) async throws {
+        let rootURL = try makeRootURL()
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        let repository = DependencyBoundSyncHistoryRepository()
+        let coordinatorQueue = DispatchQueue(label: "Pastera.SyncCoordinatorTests.boundedExport")
+        let coordinator = SyncCoordinator(
+            settingsProvider: { makeSettings(rootURL: rootURL, historyUpload: true) },
+            providerFactory: { _ in provider },
+            historyRepository: repository,
+            snippetRepository: SyncSnippetRepository(),
+            passwordVaultSyncServiceProvider: {
+                CoordinatorPasswordVaultSyncController(snapshot: makeVaultSnapshot(mode: .localOnly))
+            },
+            oneDriveProcessStatusServiceProvider: { CoordinatorOneDriveProcessStatusService() },
+            queue: coordinatorQueue
+        )
+        coordinator.start()
+        defer { coordinator.stop() }
+        coordinatorQueue.sync {}
+
+        let firstID = PasteboardHistory.ID(rawValue: "bounded-export-0")
+        let startedAt = Date()
+        repository.save(
+            id: firstID,
+            content: PasteboardContent(assets: [.init(type: .string, data: Data("First new history".utf8))]),
+            updateAt: 1
+        )
+        var firstExportDelay: TimeInterval?
+        for index in 1...12 {
+            try await Task.sleep(for: .milliseconds(100))
+            if let snapshot = try? provider.loadHistorySnapshots(excludingDeviceID: "remote-device").first,
+               snapshot.payloads.contains(where: { $0.id == firstID.rawValue }),
+               firstExportDelay == nil {
+                firstExportDelay = Date().timeIntervalSince(startedAt)
+            }
+            if continuousChanges {
+                repository.save(
+                    id: PasteboardHistory.ID(rawValue: "bounded-export-\(index)"),
+                    content: PasteboardContent(assets: [.init(type: .string, data: Data("Continuous history \(index)".utf8))]),
+                    updateAt: index + 1
+                )
+            }
+        }
+        #expect(firstExportDelay != nil, "New history must reach the local snapshot while further copies are arriving")
+        #expect((firstExportDelay ?? .infinity) < 1, "The local export must not wait for a two-second quiet period")
+        print("Local snapshot export: continuous=\(continuousChanges), firstObservedSeconds=\(firstExportDelay ?? .infinity)")
+
+        let finalID = continuousChanges ? "bounded-export-12" : firstID.rawValue
+        let deadline = Date().addingTimeInterval(1)
+        var finalPayload: PasteboardHistorySyncPayload?
+        repeat {
+            finalPayload = try provider.loadHistorySnapshots(excludingDeviceID: "remote-device")
+                .flatMap(\.payloads).first { $0.id == finalID }
+            if finalPayload != nil { break }
+            try await Task.sleep(for: .milliseconds(20))
+        } while Date() < deadline
+        #expect(finalPayload?.text == (continuousChanges ? "Continuous history 12" : "First new history"))
+    }
+
+    enum RootArrival: CaseIterable {
+        case createRoot
+        case createMissingParents
+        case movePreparedParent
+    }
+
+    @Test(arguments: [false, true], RootArrival.allCases)
+    func coordinatorRecoversWhenConfiguredRootAppears(uploadOnly: Bool, arrival: RootArrival) async throws {
+        let parentURL = try makeRootURL()
+        let preparedParentURL = try makeRootURL()
+        defer {
+            try? FileManager.default.removeItem(at: parentURL)
+            try? FileManager.default.removeItem(at: preparedParentURL)
+        }
+        let rootURL = parentURL.appendingPathComponent(
+            arrival == .createRoot ? "sync" : "missing-parent/sync", isDirectory: true
+        )
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        let remoteID = PasteboardHistory.ID(rawValue: "recovered-root-remote-history")
+        if arrival == .movePreparedParent {
+            let preparedRootURL = preparedParentURL.appendingPathComponent("sync", isDirectory: true)
+            try FileManager.default.createDirectory(at: preparedRootURL, withIntermediateDirectories: true)
+            if !uploadOnly {
+                try writeWatchedRemoteHistory(
+                    provider: OneDriveFolderSyncProvider(rootURL: preparedRootURL),
+                    id: remoteID, text: "Arrived with root", updatedAt: 2
+                )
+            }
+        }
+        let repository = DependencyBoundSyncHistoryRepository()
+        let coordinatorQueue = DispatchQueue(label: "Pastera.SyncCoordinatorTests.rootRecovery")
+        let coordinator = SyncCoordinator(
+            settingsProvider: {
+                makeSettings(rootURL: rootURL, historyUpload: true, historyImport: !uploadOnly)
+            },
+            providerFactory: { _ in provider },
+            historyRepository: repository,
+            snippetRepository: SyncSnippetRepository(),
+            passwordVaultSyncServiceProvider: {
+                CoordinatorPasswordVaultSyncController(snapshot: makeVaultSnapshot(mode: .localOnly))
+            },
+            oneDriveProcessStatusServiceProvider: { CoordinatorOneDriveProcessStatusService() },
+            queue: coordinatorQueue
+        )
+        coordinator.start()
+        defer { coordinator.stop() }
+        coordinatorQueue.sync {}
+        #expect(coordinator.status.phase == .skipped)
+
+        repository.save(
+            id: PasteboardHistory.ID(rawValue: "pending-local-history"),
+            content: PasteboardContent(assets: [.init(type: .string, data: Data("Copied while root was absent".utf8))]),
+            updateAt: 1
+        )
+        try await Task.sleep(for: .milliseconds(400))
+        if arrival == .movePreparedParent {
+            try FileManager.default.moveItem(at: preparedParentURL, to: rootURL.deletingLastPathComponent())
+        } else {
+            try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+            if !uploadOnly {
+                try writeWatchedRemoteHistory(provider: provider, id: remoteID, text: "Arrived with root", updatedAt: 2)
+            }
+        }
+
+        let recoveredAt = Date()
+        let deadline = Date().addingTimeInterval(4)
+        var exported = false
+        var imported = uploadOnly
+        repeat {
+            exported = try provider.loadHistorySnapshots(excludingDeviceID: "remote-device")
+                .flatMap(\.payloads).contains { $0.id == "pending-local-history" }
+            imported = uploadOnly || repository.fetchHistory(id: remoteID)?.title == "Arrived with root"
+            if exported && imported { break }
+            try await Task.sleep(for: .milliseconds(20))
+        } while Date() < deadline
+        #expect(exported, "Root recovery must automatically export copies captured while the folder was absent")
+        #expect(imported, "Root recovery must automatically import without a process restart or manual sync")
+        print("Sync root recovery: uploadOnly=\(uploadOnly), arrival=\(arrival), observedSeconds=\(Date().timeIntervalSince(recoveredAt))")
+    }
+
+    @Test(arguments: [false, true])
+    func coordinatorCancelsPendingHistoryExportAfterLifecycleChange(reconfigure: Bool) async throws {
+        let rootURL = try makeRootURL()
+        let replacementRootURL = try makeRootURL()
+        defer {
+            try? FileManager.default.removeItem(at: rootURL)
+            try? FileManager.default.removeItem(at: replacementRootURL)
+        }
+        let repository = DependencyBoundSyncHistoryRepository()
+        repository.save(
+            id: PasteboardHistory.ID(rawValue: "before-lifecycle-change"),
+            content: PasteboardContent(assets: [.init(type: .string, data: Data("Already exported".utf8))]),
+            updateAt: 1
+        )
+        var settings = makeSettings(rootURL: rootURL, historyUpload: true)
+        let coordinatorQueue = DispatchQueue(label: "Pastera.SyncCoordinatorTests.pendingExport")
+        let coordinator = SyncCoordinator(
+            settingsProvider: { settings },
+            historyRepository: repository,
+            snippetRepository: SyncSnippetRepository(),
+            passwordVaultSyncServiceProvider: {
+                CoordinatorPasswordVaultSyncController(snapshot: makeVaultSnapshot(mode: .localOnly))
+            },
+            oneDriveProcessStatusServiceProvider: { CoordinatorOneDriveProcessStatusService() },
+            queue: coordinatorQueue
+        )
+        coordinator.start()
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        let replacementProvider = OneDriveFolderSyncProvider(rootURL: replacementRootURL)
+        let releaseQueue = DispatchSemaphore(value: 0)
+        defer {
+            releaseQueue.signal()
+            coordinator.stop()
+        }
+        coordinatorQueue.sync {}
+        try #require(provider.loadHistorySnapshots(excludingDeviceID: "remote-device").first?.payloads.count == 1)
+
+        let enteredQueue = DispatchSemaphore(value: 0)
+        coordinatorQueue.async {
+            enteredQueue.signal()
+            _ = releaseQueue.wait(timeout: .now() + 5)
+        }
+        try #require(enteredQueue.wait(timeout: .now() + 1) == .success)
+        if reconfigure {
+            settings = makeSettings(rootURL: replacementRootURL, historyUpload: true)
+            coordinator.reloadConfiguration()
+        } else {
+            coordinatorQueue.async { coordinator.stop() }
+        }
+
+        var changeObserved = false
+        let observation = repository.observeTextSyncCandidateChanges(currentDeviceID: currentDeviceID)
+            .dropFirst()
+            .sink { changeObserved = true }
+        defer { observation.cancel() }
+        repository.save(
+            id: PasteboardHistory.ID(rawValue: "pending-lifecycle-history"),
+            content: PasteboardContent(assets: [.init(type: .string, data: Data("Pending export".utf8))]),
+            updateAt: 2
+        )
+        let observationDeadline = Date().addingTimeInterval(1)
+        while !changeObserved, Date() < observationDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try #require(changeObserved)
+        releaseQueue.signal()
+        coordinatorQueue.sync {}
+        try await Task.sleep(for: .milliseconds(400))
+
+        let payloads = try provider.loadHistorySnapshots(excludingDeviceID: "remote-device").flatMap(\.payloads)
+        #expect(payloads.map(\.id) == ["before-lifecycle-change"])
+        #expect(!replacementProvider.historySnapshotExists(deviceID: currentDeviceID))
     }
 
     @Test
@@ -1725,6 +2000,68 @@ struct SyncCoordinatorTests {
             conflictCopyCount: 0,
             lastSyncAt: nil
         )
+    }
+}
+
+// Restore the test's real database when coordinator callbacks cross a GCD boundary.
+private final class DependencyBoundSyncHistoryRepository: PasteboardHistoryRepositoryProtocol {
+    private let dependencies = withEscapedDependencies { $0 }
+    private let repository = PasteboardHistoryRepository()
+
+    func observeHistories() -> AnyPublisher<[PasteboardHistory], Never> {
+        dependencies.yield { repository.observeHistories() }
+    }
+    func observeTextSyncCandidateChanges(currentDeviceID: String?) -> AnyPublisher<Void, Never> {
+        dependencies.yield { repository.observeTextSyncCandidateChanges(currentDeviceID: currentDeviceID) }
+    }
+    func hasHistories() -> Bool { dependencies.yield { repository.hasHistories() } }
+    func fetchHistoryDetails(
+        ascending: Bool, includesThumbnailAsset: Bool, limit: Int, offset: Int
+    ) -> [PasteboardHistoryDetail] {
+        dependencies.yield {
+            repository.fetchHistoryDetails(
+                ascending: ascending, includesThumbnailAsset: includesThumbnailAsset, limit: limit, offset: offset
+            )
+        }
+    }
+    func searchHistoryDetails(
+        query: HistorySearchQuery, includesThumbnailAsset: Bool, limit: Int, offset: Int
+    ) throws -> [PasteboardHistoryDetail] {
+        try dependencies.yield {
+            try repository.searchHistoryDetails(
+                query: query, includesThumbnailAsset: includesThumbnailAsset, limit: limit, offset: offset
+            )
+        }
+    }
+    func fetchHistory(id: PasteboardHistory.ID) -> PasteboardHistory? {
+        dependencies.yield { repository.fetchHistory(id: id) }
+    }
+    func fetchContent(id: PasteboardHistory.ID) -> PasteboardContent? {
+        dependencies.yield { repository.fetchContent(id: id) }
+    }
+    func save(id: PasteboardHistory.ID, content: PasteboardContent, updateAt: Int) {
+        dependencies.yield { repository.save(id: id, content: content, updateAt: updateAt) }
+    }
+    func deleteHistory(id: PasteboardHistory.ID) { dependencies.yield { repository.deleteHistory(id: id) } }
+    func deleteAll() { dependencies.yield { repository.deleteAll() } }
+    func deleteOverflowingHistories(maxHistorySize: Int) {
+        dependencies.yield { repository.deleteOverflowingHistories(maxHistorySize: maxHistorySize) }
+    }
+    func pruneHistories(settings: HistoryRetentionSettings) {
+        dependencies.yield { repository.pruneHistories(settings: settings) }
+    }
+    func fetchSyncPayloads(
+        currentDeviceID: String?, limit: Int, maxTextBytes: Int, snapshotTextBudgetBytes: Int
+    ) -> [PasteboardHistorySyncPayload] {
+        dependencies.yield {
+            repository.fetchSyncPayloads(
+                currentDeviceID: currentDeviceID, limit: limit, maxTextBytes: maxTextBytes,
+                snapshotTextBudgetBytes: snapshotTextBudgetBytes
+            )
+        }
+    }
+    func upsertSyncPayload(_ payload: PasteboardHistorySyncPayload) throws -> Bool {
+        try dependencies.yield { try repository.upsertSyncPayload(payload) }
     }
 }
 

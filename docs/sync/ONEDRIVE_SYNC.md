@@ -316,10 +316,27 @@ for retry. Unreadable snapshots remain
 eligible for the next sync even when their size and modification time stay the
 same; an import pass reports a warning for snapshots it cannot read. A successful
 automatic import pass clears an earlier failure or warning even if it imports
-no new rows.
+no new rows. An event with neither upload nor import enabled performs no sync
+and preserves the previous status, error, and last-sync time.
 
-While an import scope is enabled, Pastera watches the sync folder for remote
-history/snippet snapshots and file manifests/assets. Events are coalesced for
+Local history changes use a 250 ms throttle on the sync queue. The first change
+can export immediately, and continuous copying no longer postpones export until
+a two-second quiet period. This bounds scheduling delay only; file I/O and
+OneDrive transfer are outside that interval.
+
+Unchanged snippet content does not replace the device's SQLite snapshot, and
+unchanged file manifest content does not update its generation time or rewrite
+the manifest. Missing assets are still restored and obsolete assets cleaned up.
+This prevents unrelated clipboard changes from repeatedly submitting identical
+snippet and file metadata to OneDrive.
+
+While a sync scope is enabled, Pastera watches the configured sync folder for
+availability and enabled remote history/snippet snapshots and file manifests/assets.
+If the folder is temporarily missing at startup, observation remains active on
+its nearest existing ancestor. When the folder appears, Pastera automatically
+imports enabled scopes and exports pending local changes, including in
+upload-only mode. This includes a prepared parent directory being moved into
+place as a whole. Events are coalesced for
 about half a second before an import pass; the default 300-second timer remains
 a fallback. This removes the polling delay after OneDrive delivers a file, but
 does not control OneDrive's cloud transfer time. File assets arriving after their

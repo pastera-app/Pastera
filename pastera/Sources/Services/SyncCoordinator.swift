@@ -481,6 +481,7 @@ final class SyncCoordinator {
     private var remoteObservationID: UUID?
     private var pendingRemoteImport: DispatchWorkItem?
     private var historyObservation: AnyCancellable?
+    private var historyObservationID: UUID?
     private var snippetObservation: AnyCancellable?
     private var configurationObservation: AnyCancellable?
     private var observedPasswordVaultSyncService: PasswordVaultSyncControlling?
@@ -563,6 +564,7 @@ final class SyncCoordinator {
         timer?.cancel()
         timer = nil
         historyObservation = nil
+        historyObservationID = nil
         snippetObservation = nil
         configurationObservation = nil
         pendingVaultSyncWorkItem?.cancel()
@@ -594,7 +596,8 @@ final class SyncCoordinator {
         let settings = settingsProvider()
         let rootAvailable = settings.rootURL.map { FileManager.default.fileExists(atPath: $0.path) } == true
         let vaultSyncEnabled = passwordVaultSyncServiceProvider().snapshot.mode == .oneDrive
-        let genericSyncEnabled = rootAvailable && settings.hasEnabledWork
+        // Keep observing configured folders while OneDrive is still making them available.
+        let genericSyncEnabled = settings.rootURL != nil && settings.hasEnabledWork
         let signature = ActivationSignature(
             rootPath: settings.rootURL?.standardizedFileURL.path,
             rootAvailable: rootAvailable,
@@ -602,7 +605,7 @@ final class SyncCoordinator {
             historyObservationEnabled: genericSyncEnabled
                 && (settings.historyUploadEnabled || settings.fileUploadEnabled),
             snippetObservationEnabled: genericSyncEnabled && settings.snippetUploadEnabled,
-            remoteObservationEnabled: genericSyncEnabled && settings.hasEnabledImportWork,
+            remoteObservationEnabled: genericSyncEnabled,
             hasEnabledWork: genericSyncEnabled,
             vaultSyncEnabled: vaultSyncEnabled
         )
@@ -616,6 +619,7 @@ final class SyncCoordinator {
             timer?.cancel()
             timer = nil
             historyObservation = nil
+            historyObservationID = nil
             snippetObservation = nil
             return
         }
@@ -678,7 +682,10 @@ final class SyncCoordinator {
             let work = DispatchWorkItem { [weak self] in
                 guard let self, self.isStarted, self.remoteObservationID == observationID else { return }
                 self.pendingRemoteImport = nil
-                self.performSync(reason: .remoteChange)
+                let rootWasAvailable = self.activationSignature?.rootAvailable == true
+                self.applyConfiguration()
+                let rootRecovered = !rootWasAvailable && self.activationSignature?.rootAvailable == true
+                self.performSync(reason: rootRecovered ? .startup : .remoteChange)
             }
             self.pendingRemoteImport = work
             self.queue.asyncAfter(deadline: .now() + 0.3, execute: work)
@@ -687,14 +694,21 @@ final class SyncCoordinator {
 
     private func observeLocalChanges(settings: SyncSettings, enabled: Bool) {
         historyObservation = nil
+        historyObservationID = nil
         if enabled, settings.historyUploadEnabled || settings.fileUploadEnabled {
+            let observationID = UUID()
+            historyObservationID = observationID
             let publisher = settings.fileUploadEnabled
                 ? historyRepository.observeHistoryChanges()
                 : historyRepository.observeTextSyncCandidateChanges(currentDeviceID: currentDeviceID)
             historyObservation = publisher
                 .dropFirst()
-                .debounce(for: .seconds(2), scheduler: DispatchQueue.main)
-                .sink { [weak self] _ in self?.syncNow(reason: .localChange) }
+                // Continuous copying must not postpone exports until the clipboard becomes quiet.
+                .throttle(for: .milliseconds(250), scheduler: queue, latest: true)
+                .sink { [weak self] _ in
+                    guard let self, self.isStarted, self.historyObservationID == observationID else { return }
+                    self.performSync(reason: .localChange)
+                }
         }
 
         snippetObservation = nil
@@ -740,6 +754,7 @@ final class SyncCoordinator {
             return
         }
         let directionPlan = directionPlan(reason: reason, settings: settings)
+        guard directionPlan.upload || directionPlan.importRemote else { return }
 
         if reason == .manual {
             setStatus(SyncStatus(
@@ -1073,8 +1088,12 @@ private final class SyncRemoteFolderObservation {
             },
             copyDescription: nil
         )
-        // Watching the parent also catches replacement/recreation of the sync root itself.
-        let paths = [rootURL.deletingLastPathComponent().path] as CFArray
+        // OneDrive may create several missing ancestors after Pastera has already started.
+        var watchURL = rootURL.deletingLastPathComponent()
+        while !FileManager.default.fileExists(atPath: watchURL.path), watchURL.path != "/" {
+            watchURL.deleteLastPathComponent()
+        }
+        let paths = [watchURL.path] as CFArray
         let flags = FSEventStreamCreateFlags(
             kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagFileEvents
                 | kFSEventStreamCreateFlagNoDefer | kFSEventStreamCreateFlagWatchRoot
@@ -1123,8 +1142,14 @@ private final class SyncRemoteFolderObservation {
 
         func shouldImport(path: String, flags: FSEventStreamEventFlags) -> Bool {
             let path = URL(fileURLWithPath: path).standardizedFileURL.path
-            let mustRescan = flags & FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs) != 0
-            if path == rootPath || (mustRescan && rootPath.hasPrefix(path + "/")) { return true }
+            let ancestorChangeFlags = FSEventStreamEventFlags(
+                kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagItemCreated
+                    | kFSEventStreamEventFlagItemRemoved | kFSEventStreamEventFlagItemRenamed
+                    | kFSEventStreamEventFlagRootChanged
+            )
+            // Moving a prepared OneDrive tree may report only the ancestor's rename.
+            if path == rootPath
+                || (rootPath.hasPrefix(path + "/") && flags & ancestorChangeFlags != 0) { return true }
             guard path.hasPrefix(rootPath + "/") else { return false }
             let components = path.dropFirst(rootPath.count + 1).split(separator: "/").map(String.init)
             guard let domain = components.first, ["history", "snippets", "files"].contains(domain),

@@ -879,6 +879,60 @@ struct PasteboardContentTests {
     }
 
     @Test
+    func oneDriveFolderSyncProviderSkipsUnchangedSnippetSnapshot() throws {
+        let rootURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        let snapshot = stableSnippetSnapshot()
+        let sqliteURL = rootURL.appendingPathComponent("snippets/devices/device-a.sqlite")
+        try provider.saveSnippetSnapshot(snapshot, deviceID: "device-a")
+        let oldDate = Date(timeIntervalSince1970: 1_000)
+        try FileManager.default.setAttributes([.modificationDate: oldDate], ofItemAtPath: sqliteURL.path)
+        let firstData = try Data(contentsOf: sqliteURL)
+
+        try provider.saveSnippetSnapshot(snapshot, deviceID: "device-a")
+
+        #expect(try FileManager.default.attributesOfItem(atPath: sqliteURL.path)[.modificationDate] as? Date == oldDate)
+        #expect(try Data(contentsOf: sqliteURL) == firstData)
+    }
+
+    @Test
+    func oneDriveFolderSyncProviderWritesChangedSnippetSnapshot() throws {
+        let rootURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        let sqliteURL = rootURL.appendingPathComponent("snippets/devices/device-a.sqlite")
+        try provider.saveSnippetSnapshot(stableSnippetSnapshot(), deviceID: "device-a")
+        let oldDate = Date(timeIntervalSince1970: 1_000)
+        try FileManager.default.setAttributes([.modificationDate: oldDate], ofItemAtPath: sqliteURL.path)
+
+        try provider.saveSnippetSnapshot(stableSnippetSnapshot(content: "changed"), deviceID: "device-a")
+
+        let loaded = try #require(provider.loadSnippetSnapshots(excludingDeviceID: "device-b").first)
+        #expect(loaded.snapshot.snippets.first?.content == "changed")
+        #expect(try FileManager.default.attributesOfItem(atPath: sqliteURL.path)[.modificationDate] as? Date != oldDate)
+    }
+
+    @Test
+    func oneDriveFolderSyncProviderRecreatesDeletedSnippetSnapshot() throws {
+        let rootURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        let snapshot = stableSnippetSnapshot()
+        let sqliteURL = rootURL.appendingPathComponent("snippets/devices/device-a.sqlite")
+        try provider.saveSnippetSnapshot(snapshot, deviceID: "device-a")
+        try FileManager.default.removeItem(at: sqliteURL)
+
+        try provider.saveSnippetSnapshot(snapshot, deviceID: "device-a")
+
+        let loaded = try #require(provider.loadSnippetSnapshots(excludingDeviceID: "device-b").first)
+        #expect(loaded.snapshot.snippets.first?.content == "stable")
+        #expect(loaded.snapshot.folders.count == 2)
+        #expect(loaded.snapshot.deletedFolders.count == 2)
+        #expect(loaded.snapshot.deletedSnippets.count == 2)
+    }
+
+    @Test
     func oneDriveFolderSyncProviderWritesFileManifestAndDirectAssetFiles() throws {
         let rootURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1014,6 +1068,88 @@ struct PasteboardContentTests {
         let attributes = try FileManager.default.attributesOfItem(atPath: objectURL.path)
         #expect(attributes[.modificationDate] as? Date == oldDate)
         #expect(try Data(contentsOf: objectURL) == Data("%PDF stable".utf8))
+    }
+
+    @Test
+    func oneDriveFolderSyncProviderSkipsUnchangedFileManifest() throws {
+        let rootURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        let snapshot = stableFileSnapshot()
+        let manifestURL = rootURL.appendingPathComponent("files/devices/device-a/manifest.json")
+        try provider.saveFileSnapshot(snapshot, deviceID: "device-a")
+        var existingManifest = try #require(
+            JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as? [String: Any]
+        )
+        existingManifest["generatedAt"] = 1_000
+        try JSONSerialization.data(withJSONObject: existingManifest).write(to: manifestURL)
+        let oldDate = Date(timeIntervalSince1970: 1_000)
+        try FileManager.default.setAttributes([.modificationDate: oldDate], ofItemAtPath: manifestURL.path)
+        let firstData = try Data(contentsOf: manifestURL)
+
+        try provider.saveFileSnapshot(snapshot, deviceID: "device-a")
+
+        #expect(try FileManager.default.attributesOfItem(atPath: manifestURL.path)[.modificationDate] as? Date == oldDate)
+        #expect(try Data(contentsOf: manifestURL) == firstData)
+    }
+
+    @Test
+    func oneDriveFolderSyncProviderMaintainsAssetsWithUnchangedManifest() throws {
+        let rootURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        let snapshot = stableFileSnapshot()
+        let deviceURL = rootURL.appendingPathComponent("files/devices/device-a")
+        let manifestURL = deviceURL.appendingPathComponent("manifest.json")
+        try provider.saveFileSnapshot(snapshot, deviceID: "device-a")
+        let assetURL = try #require(FileManager.default.enumerator(
+            at: deviceURL.appendingPathComponent("assets"), includingPropertiesForKeys: nil
+        )?.compactMap { $0 as? URL }.first { $0.pathExtension == "pdf" })
+        let orphanURL = assetURL.deletingLastPathComponent().appendingPathComponent("orphan.pdf")
+        try Data("orphan".utf8).write(to: orphanURL)
+        try FileManager.default.removeItem(at: assetURL)
+        let oldDate = Date(timeIntervalSince1970: 1_000)
+        try FileManager.default.setAttributes([.modificationDate: oldDate], ofItemAtPath: manifestURL.path)
+
+        try provider.saveFileSnapshot(snapshot, deviceID: "device-a")
+
+        #expect(try Data(contentsOf: assetURL) == Data("%PDF stable".utf8))
+        #expect(!FileManager.default.fileExists(atPath: orphanURL.path))
+        #expect(try FileManager.default.attributesOfItem(atPath: manifestURL.path)[.modificationDate] as? Date == oldDate)
+    }
+
+    @Test
+    func oneDriveFolderSyncProviderRecreatesDeletedFileManifest() throws {
+        let rootURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        let snapshot = stableFileSnapshot()
+        let manifestURL = rootURL.appendingPathComponent("files/devices/device-a/manifest.json")
+        try provider.saveFileSnapshot(snapshot, deviceID: "device-a")
+        try FileManager.default.removeItem(at: manifestURL)
+
+        try provider.saveFileSnapshot(snapshot, deviceID: "device-a")
+
+        let loaded = try #require(provider.loadFileSnapshots(excludingDeviceID: "device-b").first)
+        #expect(loaded.histories == snapshot.histories)
+    }
+
+    @Test
+    func oneDriveFolderSyncProviderWritesChangedFileManifest() throws {
+        let rootURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        let manifestURL = rootURL.appendingPathComponent("files/devices/device-a/manifest.json")
+        try provider.saveFileSnapshot(stableFileSnapshot(), deviceID: "device-a")
+        let oldDate = Date(timeIntervalSince1970: 1_000)
+        try FileManager.default.setAttributes([.modificationDate: oldDate], ofItemAtPath: manifestURL.path)
+        let changedSnapshot = stableFileSnapshot(updatedAt: 20)
+
+        try provider.saveFileSnapshot(changedSnapshot, deviceID: "device-a")
+
+        let loaded = try #require(provider.loadFileSnapshots(excludingDeviceID: "device-b").first)
+        #expect(loaded.histories.first?.updatedAt == 20)
+        #expect(try FileManager.default.attributesOfItem(atPath: manifestURL.path)[.modificationDate] as? Date != oldDate)
     }
 
     @Test
@@ -1262,6 +1398,41 @@ private final class MoveFailingFileManager: FileManager {
         }
         try super.moveItem(at: srcURL, to: dstURL)
     }
+}
+
+private func stableSnippetSnapshot(content: String = "stable") -> SnippetSyncSnapshot {
+    SnippetSyncSnapshot(
+        folders: [
+            .init(id: "folder-b", title: "B", index: 1, isEnabled: true, updatedAt: 10, deviceID: "device-a"),
+            .init(id: "folder-a", title: "A", index: 0, isEnabled: true, updatedAt: 10, deviceID: "device-a")
+        ],
+        snippets: [
+            .init(id: "snippet-a", folderID: "folder-a", title: "Snippet", content: content,
+                  index: 0, isEnabled: true, updatedAt: 10, deviceID: "device-a")
+        ],
+        deletedFolders: [
+            .init(id: "deleted-folder-b", title: "B", deletedAt: 30, deviceID: "device-a"),
+            .init(id: "deleted-folder-a", title: "A", deletedAt: 20, deviceID: "device-a")
+        ],
+        deletedSnippets: [
+            .init(id: "deleted-snippet-b", folderID: "folder-b", folderTitle: "B", content: "old B",
+                  deletedAt: 30, deviceID: "device-a"),
+            .init(id: "deleted-snippet-a", folderID: "folder-a", folderTitle: "A", content: "old A",
+                  deletedAt: 20, deviceID: "device-a")
+        ]
+    )
+}
+
+private func stableFileSnapshot(updatedAt: Int = 10) -> FileSyncExportSnapshot {
+    FileSyncExportSnapshot(
+        histories: [
+            .init(deviceID: "device-a", historyID: "history-1", updatedAt: updatedAt, assets: [
+                .init(assetIndex: 0, pasteboardType: .pdf, data: Data("%PDF stable".utf8),
+                      originalFilename: "document.pdf")
+            ])
+        ],
+        skippedAssetCount: 0
+    )
 }
 
 private func legacyLengthPrefixedHash(for assets: [PasteboardContent.Asset]) -> String {
