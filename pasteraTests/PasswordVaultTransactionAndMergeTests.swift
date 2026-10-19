@@ -4,6 +4,132 @@ import Testing
 @testable import Pastera
 
 extension PasswordVaultStoreTests {
+    @Test("KDBX folder deletion removes its passwords in one commit and survives stale merges")
+    func kdbxFolderDeletionIncludesPasswordsAndTombstones() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = KDBXPasswordVaultStore(
+            localStorage: makeReviewLocalStorage(at: root),
+            now: { Date(timeIntervalSince1970: 100.1) }
+        )
+        try store.createDatabase(masterPassword: "shared password", rememberQuickUnlock: false)
+        let removedFolder = try store.createFolder(name: "Remove")
+        let retainedFolder = try store.createFolder(name: "Keep")
+        let removedEntries = try ["Mail", "Bank"].map { title in
+            try store.create(.init(
+                folderID: removedFolder.id, title: title, website: "",
+                username: "alice", note: "", password: "secret"
+            ))
+        }
+        let retainedEntry = try store.create(.init(
+            folderID: retainedFolder.id, title: "Retained", website: "",
+            username: "bob", note: "", password: "retained-secret"
+        ))
+        let staleSnapshot = try store.encryptedSnapshot()
+        var commits = [PasswordVaultCommit]()
+        store.setCommitObserver { commits.append($0) }
+
+        try store.deleteFolder(id: removedFolder.id)
+
+        #expect(commits.count == 1)
+        #expect(commits.first?.origin == .userMutation)
+        let persisted = try KDBXReader.parse(
+            store.encryptedSnapshot().data,
+            unlockData: UnlockData(masterPassword: "shared password")
+        )
+        #expect(Set(persisted.database.root.deletedObjects.map(\.uuid)) ==
+            Set([removedFolder.id] + removedEntries.map(\.id)))
+        store.lock()
+        try store.unlock(masterPassword: "shared password", rememberQuickUnlock: false)
+        _ = try store.mergeRemoteSnapshot(staleSnapshot.data, remoteMasterPassword: nil)
+
+        #expect(try store.listFolders().map(\.id) == [retainedFolder.id])
+        #expect(try store.listEntries().map(\.id) == [retainedEntry.id])
+        #expect(try store.revealPassword(id: retainedEntry.id, reason: "test") == "retained-secret")
+    }
+
+    @Test("same-second deletions survive merging a stale encrypted snapshot after reopening")
+    func sameSecondDeletionsSurviveStaleSnapshotMerge() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var timestamp = Date(timeIntervalSince1970: 100.1)
+        let store = KDBXPasswordVaultStore(
+            localStorage: makeReviewLocalStorage(at: root),
+            now: { timestamp }
+        )
+        try store.createDatabase(masterPassword: "shared password", rememberQuickUnlock: false)
+        let removedFolder = try store.createFolder(name: "Remove")
+        let retainedFolder = try store.createFolder(name: "Keep")
+        let entry = try store.create(.init(
+            folderID: retainedFolder.id, title: "Remove Password", website: "",
+            username: "alice", note: "", password: "secret"
+        ))
+        let staleSnapshot = try store.encryptedSnapshot()
+
+        timestamp = Date(timeIntervalSince1970: 100.2)
+        try store.deleteFolder(id: removedFolder.id)
+        try store.delete(id: entry.id, reason: "test")
+        store.lock()
+        try store.unlock(masterPassword: "shared password", rememberQuickUnlock: false)
+        _ = try store.mergeRemoteSnapshot(staleSnapshot.data, remoteMasterPassword: nil)
+
+        #expect(try store.listFolders().map(\.id) == [retainedFolder.id])
+        #expect(try store.listEntries().isEmpty)
+        store.lock()
+        try store.unlock(masterPassword: "shared password", rememberQuickUnlock: false)
+        #expect(try store.listFolders().map(\.id) == [retainedFolder.id])
+        #expect(try store.listEntries().isEmpty)
+    }
+
+    @Test("remote same-second tombstones delete stale in-memory folders and passwords")
+    func sameSecondRemoteDeletionsRemoveStaleMemory() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var timestamp = Date(timeIntervalSince1970: 100.1)
+        let active = KDBXPasswordVaultStore(
+            localStorage: makeReviewLocalStorage(at: root),
+            now: { timestamp }
+        )
+        try active.createDatabase(masterPassword: "shared password", rememberQuickUnlock: false)
+        let removedFolder = try active.createFolder(name: "Remove")
+        let retainedFolder = try active.createFolder(name: "Keep")
+        let entry = try active.create(.init(
+            folderID: retainedFolder.id, title: "Remove Password", website: "",
+            username: "alice", note: "", password: "secret"
+        ))
+        let deleting = KDBXPasswordVaultStore(
+            localStorage: makeReviewLocalStorage(at: root),
+            now: { timestamp }
+        )
+        try deleting.unlock(masterPassword: "shared password", rememberQuickUnlock: false)
+        timestamp = Date(timeIntervalSince1970: 100.2)
+        try deleting.deleteFolder(id: removedFolder.id)
+        try deleting.delete(id: entry.id, reason: "test")
+
+        try active.reloadAndMerge()
+
+        #expect(try active.listFolders().map(\.id) == [retainedFolder.id])
+        #expect(try active.listEntries().isEmpty)
+    }
+
+    @Test("folder tombstones preserve modifications in a later KDBX second")
+    func folderTombstonesPreserveLaterModifications() throws {
+        let folderID = UUID()
+        let local = makeReviewContent(groupID: folderID, modifiedAt: 100.6, entries: [])
+        var remote = local
+        remote.database.root.group.groups = []
+        remote.database.root.deletedObjects = [
+            .init(uuid: folderID, deletionTime: Date(timeIntervalSince1970: 100.2))
+        ]
+
+        let result = KDBXVaultMerger().merge(local: local, remote: remote)
+
+        #expect(result.content.database.root.group.groups.map(\.uuid) == [folderID])
+    }
+
     @Test("a second store cannot read the same path until the first write transaction releases")
     func concurrentVaultWritersMerge() throws {
         let root = FileManager.default.temporaryDirectory

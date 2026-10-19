@@ -291,9 +291,12 @@ final class KDBXPasswordVaultStore: PasswordVaultStore, PasswordVaultSyncAccess 
         guard let index = content.database.root.group.groups.firstIndex(where: { $0.uuid == id }) else {
             throw PasswordVaultError.folderNotFound
         }
-        guard content.database.root.group.groups[index].entries.isEmpty else { throw PasswordVaultError.folderNotEmpty }
-        content.database.root.group.groups.remove(at: index)
-        content.database.root.deletedObjects.append(.init(uuid: id, deletionTime: now()))
+        let folder = content.database.root.group.groups.remove(at: index)
+        let deletionTime = now()
+        content.database.root.deletedObjects.append(.init(uuid: id, deletionTime: deletionTime))
+        content.database.root.deletedObjects.append(contentsOf: folder.entries.map {
+            .init(uuid: $0.uuid, deletionTime: deletionTime)
+        })
         try save(content)
     }
 
@@ -544,6 +547,7 @@ extension KDBXPasswordVaultStore {
         lastRevision = persistence.revision
         state = .unlocked
         publishCommit(data: persistence.data, origin: .syncMerge)
+        sessionBinding().onStateChange?()
         return PasswordVaultMergeApplication(
             encryptedSnapshot: PasswordVaultEncryptedSnapshot(
                 data: persistence.data,

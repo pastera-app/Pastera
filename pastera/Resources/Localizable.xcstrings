@@ -1,6 +1,27 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "Folder changed. Review deletion again." : { "localizations" : {
+      "en" : { "stringUnit" : { "state" : "translated", "value" : "Folder changed. Review deletion again." } },
+      "de" : { "stringUnit" : { "state" : "translated", "value" : "Ordner geändert. Löschen erneut prüfen." } },
+      "it" : { "stringUnit" : { "state" : "translated", "value" : "Cartella modificata. Rivedi l'eliminazione." } },
+      "ja" : { "stringUnit" : { "state" : "translated", "value" : "内容が変わりました。削除を再確認してください。" } },
+      "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "文件夹内容已变化，请重新确认删除。" } }
+    } },
+    "Delete folder + %lld passwords? Delete again." : { "localizations" : {
+      "en" : { "stringUnit" : { "state" : "translated", "value" : "Delete folder + %lld passwords? Delete again." } },
+      "de" : { "stringUnit" : { "state" : "translated", "value" : "Ordner + %lld Passwörter löschen? Erneut löschen." } },
+      "it" : { "stringUnit" : { "state" : "translated", "value" : "Eliminare cartella e %lld password? Premi ancora." } },
+      "ja" : { "stringUnit" : { "state" : "translated", "value" : "フォルダと %lld 件のパスワードを削除？もう一度削除。" } },
+      "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "再次删除以确认：文件夹及 %lld 条密码" } }
+    } },
+    "Authenticate to delete this folder and its passwords." : { "localizations" : {
+      "en" : { "stringUnit" : { "state" : "translated", "value" : "Authenticate to delete this folder and its passwords." } },
+      "de" : { "stringUnit" : { "state" : "translated", "value" : "Authentifizieren, um diesen Ordner und seine Passwörter zu löschen." } },
+      "it" : { "stringUnit" : { "state" : "translated", "value" : "Autenticati per eliminare questa cartella e le sue password." } },
+      "ja" : { "stringUnit" : { "state" : "translated", "value" : "このフォルダとパスワードを削除するには認証してください。" } },
+      "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "请验证身份以删除此文件夹及其中的密码。" } }
+    } },
     "A new version of Pastera is available" : { "localizations" : {
       "en" : { "stringUnit" : { "state" : "translated", "value" : "A new version of Pastera is available" } }, "de" : { "stringUnit" : { "state" : "translated", "value" : "Eine neue Version von Pastera ist verfügbar" } }, "it" : { "stringUnit" : { "state" : "translated", "value" : "È disponibile una nuova versione di Pastera" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "Pastera の新しいバージョンが利用できます" } }, "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "新版本的 Pastera 已经发布" } }
     } },

@@ -78,6 +78,11 @@ the compatible path used by earlier password-vault builds:
 <selected-OneDrive-sync-root>/PasteraSync/vault/PasteraVault.kdbx
 ```
 
+On a Mac without a local vault, enabling password-vault sync first prepares the
+local copy from the existing encrypted OneDrive file. If that file is not yet
+available, a later sync retries the same preparation without requiring an app
+restart. Existing local vaults keep their normal merge and unlock lifecycle.
+
 `PasswordVaultSyncMetadata.json` contains only lifecycle state and digests:
 mode, local and last-synced revisions, local and observed-remote SHA-256
 digests, pending-merge digest, last-sync time, pending/conflict counts, failure,
@@ -107,10 +112,18 @@ decisions: no change, upload local, apply remote, or merge both.
 Concurrent password-vault changes are merged at KDBX group and entry level.
 Independent entries are combined; newer versions win while the older value is
 retained in KDBX history (up to ten versions); equal-timestamp divergent values
-produce a new entry titled with `(Conflict)`. Newer KDBX deletion tombstones
-remove older matching entries or groups. A different remote master password is
-accepted only as a one-shot in-memory merge credential and is cleared when the
-page is submitted or left.
+produce a new entry titled with `(Conflict)`. KDBX deletion tombstones remove
+matching entries or groups whose modification time is no later than the
+deletion time, compared at KDBX's persisted whole-second precision. A different
+remote master password is accepted only as a one-shot in-memory merge credential
+and is cleared when the page is submitted or left.
+
+Deleting a folder also deletes its passwords. The password-vault UI shows the
+password count before the second delete action and requires system
+authentication. If passwords are added, removed, or moved while deletion is
+being confirmed or authenticated, the user must review the current contents
+again. The folder and password tombstones
+are saved together so older replicas cannot restore the deleted items.
 
 Once password-vault sync is enabled, the mode remains `oneDrive`. The main
 OneDrive footer icon reports the desktop client's process state together with

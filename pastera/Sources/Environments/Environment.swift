@@ -82,6 +82,14 @@ struct Environment {
         )
         self.passwordVaultStore = resolvedPasswordVaultStore
         let syncSettingsStore = UserDefaultsSyncSettingsStore(defaults: defaults)
+        let resolvedPasswordVaultMigrator = passwordVaultMigrator ?? (usesProductionVaultStore
+            && prepareProductionPasswordVault
+            ? PasswordVaultMigrationService(
+                localStorage: localStorage,
+                metadataStore: metadataStore,
+                legacySyncRootProvider: { syncSettingsStore.settings().rootURL }
+            )
+            : nil)
         let resolvedPasswordVaultSyncService: PasswordVaultSyncControlling
         if let passwordVaultSyncService {
             resolvedPasswordVaultSyncService = passwordVaultSyncService
@@ -96,6 +104,10 @@ struct Environment {
                     rootURLProvider: { syncSettingsStore.settings().rootURL },
                     rootURLSetter: { syncSettingsStore.setRootURL($0) },
                     rootValidator: Self.validatePasswordVaultSyncRoot,
+                    prepareLocalCopy: {
+                        guard let resolvedPasswordVaultMigrator else { return }
+                        resolvedPasswordVaultStore.prepareLocalCopy(using: resolvedPasswordVaultMigrator)
+                    },
                     queue: vaultQueue
                 )
             } catch {
@@ -120,14 +132,6 @@ struct Environment {
             storeQueue: vaultQueue
         )
         self.passwordVaultUIController = resolvedPasswordVaultUIController
-        let resolvedPasswordVaultMigrator = passwordVaultMigrator ?? (usesProductionVaultStore
-            && prepareProductionPasswordVault
-            ? PasswordVaultMigrationService(
-                localStorage: localStorage,
-                metadataStore: metadataStore,
-                legacySyncRootProvider: { syncSettingsStore.settings().rootURL }
-            )
-            : nil)
         let retryLocalPreparation = retryPasswordVaultLocalPreparation ?? {
             guard let resolvedPasswordVaultMigrator else { return }
             resolvedPasswordVaultUIController.vaultAgentExecutor.async {

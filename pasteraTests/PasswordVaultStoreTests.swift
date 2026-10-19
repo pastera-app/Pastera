@@ -572,7 +572,7 @@ extension PasswordVaultStoreTests {
         #expect(Set(result.content.database.root.group.groups.flatMap(\.entries).map(\.uuid)) == [first.uuid, second.uuid])
     }
 
-    @Test("only tombstones newer than an entry delete it")
+    @Test("older tombstones preserve newer entries")
     func mergerAppliesOnlyLaterTombstones() {
         let folderID = UUID()
         let deletedEntryID = UUID()
@@ -631,7 +631,7 @@ extension PasswordVaultStoreTests {
         #expect(try JSONDecoder().decode(PasswordVaultMetadata.self, from: savedMetadata).version == 2)
     }
 
-    @Test("folders are single-level and non-empty folders cannot be deleted")
+    @Test("legacy Keychain folders protect contained passwords from deletion")
     func folderLifecycleProtectsContainedPasswords() throws {
         let client = InMemoryPasswordVaultKeychainClient()
         let store = KeychainPasswordVaultStore(client: client)

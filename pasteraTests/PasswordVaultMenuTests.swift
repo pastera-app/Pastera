@@ -696,6 +696,124 @@ struct PasswordVaultMenuTests {
         #expect(controller.passwordVaultEditorStepForTesting == "title")
     }
 
+    @Test("folder deletion confirms all passwords again when its contents change")
+    func folderDeletionConfirmsCurrentContentsThroughRealButton() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = KDBXPasswordVaultStore(localStorage: makeMenuLocalStorage(at: root))
+        try store.createDatabase(masterPassword: "folder deletion test", rememberQuickUnlock: false)
+        let folder = try store.createFolder(name: "Work")
+        _ = try store.create(.init(
+            folderID: folder.id, title: "Mail", website: "", username: "alice", note: "", password: "secret"
+        ))
+        let authorizer = FolderDeletionAuthorizer()
+        let vaultController = PasswordVaultUIController(store: store, authorizer: authorizer)
+        let controller = makeFolderDeletionController(vaultController)
+        controller.openPasswordVaultFromMainMenu()
+        controller.show(at: NSPoint(x: 200, y: 200), pinned: true)
+        defer { _ = controller.close() }
+        controller.toggleWorkspaceEditingForTesting()
+        controller.selectMainMenuItemForTesting(title: "Work")
+        #expect(controller.mainMenuRowVisibleButtonIdentifiersForTesting(title: "Work")
+            .contains("mainMenuRowDeleteButton"))
+
+        controller.performMainMenuButtonClickForTesting(identifier: "mainMenuRowDeleteButton")
+
+        #expect(controller.mainMenuVisibleRowTitlesForTesting.contains(String(format: String(localized:
+            "Delete folder + %lld passwords? Delete again."), 1)))
+        #expect(authorizer.reasons.isEmpty)
+        #expect(try store.listEntries().count == 1)
+        let added: Result<Void, PasswordVaultError> = await withCheckedContinuation { continuation in
+            vaultController.createEntry(.init(
+                folderID: folder.id, title: "Bank", website: "", username: "alice", note: "", password: "bank-secret"
+            )) { continuation.resume(returning: $0) }
+        }
+        try added.get()
+        let authorizationCountBeforeDeletion = authorizer.reasons.count
+        controller.reloadContentIfVisible()
+        controller.selectMainMenuItemForTesting(title: "Work")
+
+        controller.performMainMenuButtonClickForTesting(identifier: "mainMenuRowDeleteButton")
+
+        #expect(controller.mainMenuVisibleRowTitlesForTesting.contains(String(format: String(localized:
+            "Delete folder + %lld passwords? Delete again."), 2)))
+        #expect(authorizer.reasons.count == authorizationCountBeforeDeletion)
+        #expect(try store.listEntries().count == 2)
+        controller.selectMainMenuItemForTesting(title: "Work")
+        controller.performMainMenuButtonClickForTesting(identifier: "mainMenuRowDeleteButton")
+        await waitUntil("folder and its passwords deleted") { (try? vaultController.folders().isEmpty) == true }
+        await waitUntil("folder deletion reflected") {
+            !controller.mainMenuVisibleRowTitlesForTesting.contains("Work")
+        }
+
+        #expect(authorizer.reasons.count == authorizationCountBeforeDeletion + 1)
+        #expect(try store.listEntries().isEmpty)
+    }
+
+    @Test("canceling folder deletion authentication preserves the encrypted vault")
+    func folderDeletionAuthenticationCancellationPreservesVault() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = KDBXPasswordVaultStore(localStorage: makeMenuLocalStorage(at: root))
+        try store.createDatabase(masterPassword: "folder deletion test", rememberQuickUnlock: false)
+        let folder = try store.createFolder(name: "Work")
+        let entry = try store.create(.init(
+            folderID: folder.id, title: "Mail", website: "", username: "alice", note: "", password: "secret"
+        ))
+        let before = try store.encryptedSnapshot().digest
+        let authorizer = FolderDeletionAuthorizer(result: .failure(.userCancelled))
+        let controller = PasswordVaultUIController(store: store, authorizer: authorizer)
+
+        let result: Result<Void, PasswordVaultError> = await withCheckedContinuation { continuation in
+            controller.deleteFolder(id: folder.id) { continuation.resume(returning: $0) }
+        }
+
+        if case let .failure(error) = result {
+            #expect(error == .userCancelled)
+        } else {
+            Issue.record("Authentication cancellation must reject folder deletion")
+        }
+        #expect(authorizer.reasons.count == 1)
+        #expect(try store.encryptedSnapshot().digest == before)
+        #expect(try controller.folders().map(\.id) == [folder.id])
+        #expect(try controller.entries().map(\.id) == [entry.id])
+    }
+
+    @Test("passwords arriving during folder deletion authentication require a new confirmation")
+    func folderDeletionRejectsContentsChangedDuringAuthentication() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = KDBXPasswordVaultStore(localStorage: makeMenuLocalStorage(at: root))
+        try store.createDatabase(masterPassword: "folder deletion test", rememberQuickUnlock: false)
+        let folder = try store.createFolder(name: "Work")
+        let first = try store.create(.init(
+            folderID: folder.id, title: "Mail", website: "", username: "alice", note: "", password: "secret"
+        ))
+        let authorizer = DeferredFolderDeletionAuthorizer()
+        let controller = PasswordVaultUIController(store: store, authorizer: authorizer)
+        var deletionResult: Result<Void, PasswordVaultError>?
+        controller.deleteFolder(id: folder.id) { deletionResult = $0 }
+        let completeAuthorization = try #require(authorizer.completion)
+        let added = try controller.vaultAgentExecutor.sync {
+            try store.create(.init(
+                folderID: folder.id, title: "Cloud Arrival", website: "", username: "bob", note: "", password: "new-secret"
+            ))
+        }
+        let beforeDeletion = try store.encryptedSnapshot().digest
+
+        completeAuthorization(.success(()))
+        await waitUntil("folder deletion result returned") { deletionResult != nil }
+
+        if case let .failure(error) = try #require(deletionResult) {
+            #expect(error == .externalConflict)
+        } else {
+            Issue.record("Changed folder contents must require a new confirmation")
+        }
+        #expect(try store.encryptedSnapshot().digest == beforeDeletion)
+        #expect(try controller.folders().map(\.id) == [folder.id])
+        #expect(Set(try controller.entries().map(\.id)) == [first.id, added.id])
+    }
+
     @Test("the AppKit flow writes and copies a real KDBX password entry")
     // swiftlint:disable:next function_body_length
     func appKitFlowUsesRealKDBXStore() async throws {
@@ -809,10 +927,17 @@ struct PasswordVaultMenuTests {
         #expect(controller.mainMenuVisibleRowTitlesForTesting.contains("Delete again to confirm."))
         controller.performMainMenuRowDeleteForTesting(title: "Mail Updated")
         await waitUntil("entry deletion persisted") { (try? store.listEntries().isEmpty) == true }
-        controller.performMainMenuRowDeleteForTesting(title: "Work")
+        await waitUntil("entry deletion reflected") {
+            !controller.mainMenuVisibleRowTitlesForTesting.contains("Mail Updated")
+        }
+        controller.selectMainMenuItemForTesting(title: "Work")
+        #expect(controller.mainMenuRowVisibleButtonIdentifiersForTesting(title: "Work")
+            .contains("mainMenuRowDeleteButton"))
+        controller.performMainMenuButtonClickForTesting(identifier: "mainMenuRowDeleteButton")
         #expect((try? store.listFolders().isEmpty) == false)
         #expect(controller.mainMenuVisibleRowTitlesForTesting.contains("Delete again to confirm."))
-        controller.performMainMenuRowDeleteForTesting(title: "Work")
+        controller.selectMainMenuItemForTesting(title: "Work")
+        controller.performMainMenuButtonClickForTesting(identifier: "mainMenuRowDeleteButton")
         await waitUntil("folder deletion persisted") { (try? store.listFolders().isEmpty) == true }
     }
 
@@ -1618,6 +1743,24 @@ struct PasswordVaultMenuTests {
         )
     }
 
+    private func makeFolderDeletionController(_ vaultController: PasswordVaultUIController) -> MainMenuPanelController {
+        MainMenuPanelController(
+            historyTitle: "History", historyImage: nil, snippetTitle: "Snippet", snippetImage: nil,
+            itemsProvider: { [] }, onOpenHistory: {}, onOpenSnippets: {},
+            passwordVaultDataSource: MainMenuPasswordVaultDataSource(
+                state: { vaultController.state },
+                fetchFolders: vaultController.folders, fetchEntries: vaultController.entries,
+                copyPassword: vaultController.copyPassword, loadDraft: vaultController.loadDraft,
+                createEntry: vaultController.createEntry, updateEntry: vaultController.updateEntry,
+                deleteEntry: vaultController.deleteEntry,
+                createFolder: { _ in throw PasswordVaultError.saveFailed },
+                renameFolder: { _, _ in throw PasswordVaultError.saveFailed },
+                deleteFolder: { _ in throw PasswordVaultError.saveFailed },
+                deleteFolderAsync: vaultController.deleteFolder
+            )
+        )
+    }
+
     private func makeVaultController(
         folders: [PasswordVaultFolder],
         entries: [PasswordVaultEntry]
@@ -1798,6 +1941,28 @@ private func waitUntil(
 private final class AllowPasswordVaultAuthorizer: PasswordVaultAuthorizing {
     func authorize(reason: String, completion: @escaping (Result<Void, PasswordVaultError>) -> Void) {
         completion(.success(()))
+    }
+}
+
+private final class FolderDeletionAuthorizer: PasswordVaultAuthorizing {
+    let result: Result<Void, PasswordVaultError>
+    private(set) var reasons = [String]()
+
+    init(result: Result<Void, PasswordVaultError> = .success(())) {
+        self.result = result
+    }
+
+    func authorize(reason: String, completion: @escaping (Result<Void, PasswordVaultError>) -> Void) {
+        reasons.append(reason)
+        completion(result)
+    }
+}
+
+private final class DeferredFolderDeletionAuthorizer: PasswordVaultAuthorizing {
+    private(set) var completion: ((Result<Void, PasswordVaultError>) -> Void)?
+
+    func authorize(reason: String, completion: @escaping (Result<Void, PasswordVaultError>) -> Void) {
+        self.completion = completion
     }
 }
 

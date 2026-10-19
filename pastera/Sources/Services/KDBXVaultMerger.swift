@@ -160,13 +160,19 @@ final class KDBXVaultMerger {
         from group: inout KDBX.Group,
         tombstones: [UUID: KDBX.DeletedObject]
     ) {
+        func isDeleted(_ id: UUID, modifiedAt: Date?) -> Bool {
+            guard let deletion = tombstones[id] else { return false }
+            let modificationTime = modifiedAt ?? .distantPast
+            // KDBXKit rounds persisted dates to whole seconds. Deletion wins ties
+            // so stale in-memory objects and encrypted replicas cannot revive them.
+            return deletion.deletionTime.timeIntervalSince1970.rounded() >=
+                modificationTime.timeIntervalSince1970.rounded()
+        }
         group.entries.removeAll { entry in
-            guard let deletion = tombstones[entry.uuid] else { return false }
-            return deletion.deletionTime > (entry.times?.lastModificationTime ?? .distantPast)
+            isDeleted(entry.uuid, modifiedAt: entry.times?.lastModificationTime)
         }
         group.groups.removeAll { child in
-            guard let deletion = tombstones[child.uuid] else { return false }
-            return deletion.deletionTime > (child.times?.lastModificationTime ?? .distantPast)
+            isDeleted(child.uuid, modifiedAt: child.times?.lastModificationTime)
         }
         for index in group.groups.indices {
             removeDeleted(from: &group.groups[index], tombstones: tombstones)

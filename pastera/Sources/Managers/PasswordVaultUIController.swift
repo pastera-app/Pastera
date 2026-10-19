@@ -236,7 +236,16 @@ final class PasswordVaultUIController: PasswordVaultAgentAccess {
     }
 
     func deleteFolder(id: UUID, completion: @escaping (Result<Void, PasswordVaultError>) -> Void) {
-        perform(completion: completion) { try self.store.deleteFolder(id: id) }
+        let confirmedEntryIDs = Set(currentSnapshot.entries.filter { $0.folderID == id }.map(\.id))
+        authorize(
+            reason: String(localized: "Authenticate to delete this folder and its passwords."),
+            recordsInteractiveSensitiveUse: true,
+            completion: completion
+        ) {
+            let currentEntryIDs = Set(try self.store.listEntries().filter { $0.folderID == id }.map(\.id))
+            guard currentEntryIDs == confirmedEntryIDs else { throw PasswordVaultError.externalConflict }
+            try self.store.deleteFolder(id: id)
+        }
     }
 
     func moveEntry(id: UUID, to folderID: UUID, completion: @escaping (Result<Void, PasswordVaultError>) -> Void) {

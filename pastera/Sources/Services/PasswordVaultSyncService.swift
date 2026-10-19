@@ -44,6 +44,7 @@ final class PasswordVaultSyncService: PasswordVaultSyncControlling {
     private let rootURLProvider: () -> URL?
     private let rootURLSetter: (URL) -> Void
     private let rootValidator: (URL) -> PasswordVaultSyncFailure?
+    private let prepareLocalCopy: (() -> Void)?
     private let queue: DispatchQueue
     private let callbackDispatcher: CallbackDispatcher
     private let now: () -> Date
@@ -62,6 +63,7 @@ final class PasswordVaultSyncService: PasswordVaultSyncControlling {
         rootURLProvider: @escaping () -> URL?,
         rootURLSetter: @escaping (URL) -> Void,
         rootValidator: @escaping (URL) -> PasswordVaultSyncFailure?,
+        prepareLocalCopy: (() -> Void)? = nil,
         queue: DispatchQueue = DispatchQueue(label: "com.pastera.password-vault-sync"),
         callbackDispatcher: CallbackDispatcher? = nil,
         now: @escaping () -> Date = Date.init
@@ -74,6 +76,7 @@ final class PasswordVaultSyncService: PasswordVaultSyncControlling {
         self.rootURLProvider = rootURLProvider
         self.rootURLSetter = rootURLSetter
         self.rootValidator = rootValidator
+        self.prepareLocalCopy = prepareLocalCopy
         self.queue = queue
         self.callbackDispatcher = callbackDispatcher ?? { callback in
             DispatchQueue.main.async(execute: callback)
@@ -222,6 +225,7 @@ private extension PasswordVaultSyncService {
         }
 
         do {
+            try prepareLocalCopyIfNeeded()
             let local = try access.encryptedSnapshot()
             let remote = try cloudReplica.read(rootURL: rootURL)
             let localChanged = metadata.localRevision != metadata.lastSyncedLocalRevision
@@ -253,6 +257,28 @@ private extension PasswordVaultSyncService {
             let failure = Self.syncFailure(from: error)
             fail(failure, remoteVaultAvailable: nil)
             completeIfPresent(.failure(failure), completion: completion)
+        }
+    }
+    private func prepareLocalCopyIfNeeded() throws {
+        switch access.state {
+        case .notConfigured, .localCopyUnavailable:
+            break
+        default:
+            return
+        }
+        if let prepareLocalCopy {
+            prepareLocalCopy()
+            metadata = try metadataStore.load()
+        }
+        switch access.state {
+        case .localCopyUnavailable(.remoteCorrupted):
+            throw PasswordVaultSyncFailure.remoteCorrupted
+        case .localCopyUnavailable(.localWriteFailed), .localCopyUnavailable(.localCleanupFailed):
+            throw PasswordVaultSyncFailure.remoteWriteFailed
+        default:
+            guard Self.isLocalVaultAvailable(access.state) else {
+                throw PasswordVaultSyncFailure.remoteUnavailable
+            }
         }
     }
     private func resolvedRootURL() throws -> URL {

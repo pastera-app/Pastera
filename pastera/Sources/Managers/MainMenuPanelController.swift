@@ -377,7 +377,7 @@ final class MainMenuPanelController: NSObject, NSWindowDelegate, NSSearchFieldDe
     }
 
     private enum PasswordVaultPendingDeletion: Equatable {
-        case folder(PasswordVaultFolder.ID)
+        case folder(PasswordVaultFolder.ID, entryIDs: Set<PasswordVaultEntry.ID>)
         case entry(PasswordVaultEntry.ID)
     }
 
@@ -2710,13 +2710,27 @@ extension MainMenuPanelController {
     }
 
     private func deletePasswordVaultFolder(_ id: PasswordVaultFolder.ID) {
-        guard confirmPasswordVaultDeletion(.folder(id)) else { return }
-        passwordVaultDataSource?.deleteFolder(id) { [weak self] result in
+        guard let passwordVaultDataSource else { return }
+        let entryIDs: Set<PasswordVaultEntry.ID>
+        do {
+            entryIDs = Set(try passwordVaultDataSource.fetchEntries().filter { $0.folderID == id }.map(\.id))
+        } catch {
+            passwordVaultStatusMessage = (error as? PasswordVaultError).map(passwordVaultMessage)
+                ?? String(localized: "Password Vault Unavailable")
+            reloadContentKeepingTopLeft()
+            return
+        }
+        guard confirmPasswordVaultDeletion(.folder(id, entryIDs: entryIDs)) else { return }
+        passwordVaultDataSource.deleteFolder(id) { [weak self] result in
             self?.passwordVaultPendingDeletion = nil
             switch result {
             case .success:
                 if self?.expandedPasswordVaultFolderID == id { self?.expandedPasswordVaultFolderID = nil }
                 self?.passwordVaultStatusMessage = nil
+            case .failure(.userCancelled):
+                self?.passwordVaultStatusMessage = nil
+            case .failure(.externalConflict):
+                self?.passwordVaultStatusMessage = String(localized: "Folder changed. Review deletion again.")
             case let .failure(error):
                 self?.passwordVaultStatusMessage = self?.passwordVaultMessage(error)
             }
@@ -2727,7 +2741,12 @@ extension MainMenuPanelController {
     private func confirmPasswordVaultDeletion(_ deletion: PasswordVaultPendingDeletion) -> Bool {
         guard passwordVaultPendingDeletion == deletion else {
             passwordVaultPendingDeletion = deletion
-            passwordVaultStatusMessage = String(localized: "Delete again to confirm.")
+            if case let .folder(_, entryIDs) = deletion, !entryIDs.isEmpty {
+                passwordVaultStatusMessage = String(format: String(localized:
+                    "Delete folder + %lld passwords? Delete again."), entryIDs.count)
+            } else {
+                passwordVaultStatusMessage = String(localized: "Delete again to confirm.")
+            }
             reloadContentKeepingTopLeft()
             return false
         }

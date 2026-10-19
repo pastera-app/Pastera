@@ -19,17 +19,17 @@ macOS 应用是当前可运行的产品基线。原生 Windows 客户端将在�
 
 ## 下载
 
-[下载当前 Beta](https://github.com/pastera-app/Pastera/releases/tag/v3.0.7-beta) 或 [查看全部 Releases](https://github.com/pastera-app/Pastera/releases)。
+[下载当前 Beta](https://github.com/pastera-app/Pastera/releases/tag/v3.0.8-beta) 或 [查看全部 Releases](https://github.com/pastera-app/Pastera/releases)。
 
-### 当前版本：3.0.7-beta
+### 当前版本：3.0.8-beta
 
-- 缩短历史写出等待，连续复制时也会及时写入本地同步快照。
-- OneDrive 同步目录延迟出现或被整体替换后，自动恢复上传与导入。
-- 跳过未变化的片段快照和文件清单，减少无效写入和云端同步负担。
-- 停止同步或切换目录后，取消旧观察器尚未执行的历史上传。
-- 仅上传时保留真实失败状态，避免无关的远端变化显示为同步成功。
+- 密码箱支持删除含密码的文件夹：先显示密码数量，二次确认并验证身份后一起删除。
+- 确认或认证期间有密码移入、移出或新增时，中止删除并要求重新确认。
+- 修复同一秒内删除的文件夹或密码被旧同步副本恢复的问题。
+- 修复另一台 Mac 首次开启密码箱同步时未导入 OneDrive 副本的问题，文件暂不可读时可在后续同步重试。
+- 同步合并后立即刷新密码箱列表。
 
-跨设备传输仍由 OneDrive 完成，本版不承诺两台 Mac 在 1 秒内送达。
+两台真实 Mac 的 OneDrive 首次下载与打开流程仍需使用本版实测。
 
 系统要求：macOS 15 Sequoia 或更高版本。
 
