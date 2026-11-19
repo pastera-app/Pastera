@@ -19,19 +19,20 @@ macOS 应用是当前可运行的产品基线。原生 Windows 客户端将在�
 
 ## 下载
 
-[下载当前 Beta](https://github.com/pastera-app/Pastera/releases/tag/v3.0.8-beta) 或 [查看全部 Releases](https://github.com/pastera-app/Pastera/releases)。
+[下载当前 Beta](https://github.com/pastera-app/Pastera/releases/tag/v3.0.9-beta) 或 [查看全部 Releases](https://github.com/pastera-app/Pastera/releases)。
 
-### 当前版本：3.0.8-beta
+### 当前版本：3.0.9-beta
 
-- 密码箱支持删除含密码的文件夹：先显示密码数量，二次确认并验证身份后一起删除。
-- 确认或认证期间有密码移入、移出或新增时，中止删除并要求重新确认。
-- 修复同一秒内删除的文件夹或密码被旧同步副本恢复的问题。
-- 修复另一台 Mac 首次开启密码箱同步时未导入 OneDrive 副本的问题，文件暂不可读时可在后续同步重试。
-- 同步合并后立即刷新密码箱列表。
+- 密码箱副本未变化时刷新最近同步时间并清除旧错误；状态保存失败时不会显示同步成功。
+- 仅开启密码箱同步时也可手动同步，同步结束后“立即同步”按钮恢复可用。
+- OneDrive 目录离线或暂不可用时，仍可关闭已启用的历史、片段和文件类型同步选项。
+- 修复同一秒内历史文本编辑未同步，以及再次复制相同内容导致同步版本回退的问题。
 
-两台真实 Mac 的 OneDrive 首次下载与打开流程仍需使用本版实测。
+两台真实 Mac 的 OneDrive 云端传输、首次下载与打开流程仍需使用本版实测。
 
-系统要求：macOS 15 Sequoia 或更高版本。
+系统要求：macOS 15 Sequoia 或更高版本；提供 Apple Silicon 与 Intel 通用 DMG。
+
+更新提示会打开浏览器，需下载 DMG 并手动安装。
 
 > [!WARNING]
 > 当前公开 DMG 使用 ad-hoc 签名，尚未经过 Apple 公证。首次打开若被 macOS 阻止，请前往“系统设置 > 隐私与安全性”，确认应用来源后选择“仍要打开”。

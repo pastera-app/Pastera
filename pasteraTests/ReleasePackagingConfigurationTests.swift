@@ -261,8 +261,8 @@ struct ReleasePackagingConfigurationTests {
         let cask = try projectText("Casks/pastera.rb")
 
         #expect(cask.contains("cask \"pastera\" do"))
-        #expect(cask.contains("version \"3.0.8-beta\""))
-        #expect(cask.contains("sha256 \"ffcd2a85f4313fe8ddbdc4ec513516557f99a377421de9c3315f8dbef4684c63\""))
+        #expect(cask.contains("version \"3.0.9-beta\""))
+        #expect(cask.contains("sha256 \"b61df0e13c7ae1f319cbbad79a01f2a3adda9a6e29d86c2b1a89518860324c38\""))
         #expect(cask.contains("https://github.com/pastera-app/Pastera/releases/download/v#{version}/Pastera-#{version}-macOS.dmg"))
         #expect(cask.contains("app \"Pastera.app\""))
         #expect(cask.contains("uninstall quit: \"com.pastera-app.Pastera\""))
