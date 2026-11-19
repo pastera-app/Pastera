@@ -324,6 +324,7 @@ final class CPYSyncPreferenceViewController: PasteraPreferencePageViewController
             let refresh: () -> Void = { [weak self] in
                 guard let self, self.isViewLoaded else { return }
                 self.updatePasswordVaultSyncSummary()
+                self.updateSyncActivityState()
             }
             if Thread.isMainThread {
                 refresh()
@@ -597,7 +598,7 @@ private extension CPYSyncPreferenceViewController {
     }
 
     @objc func toggleHistoryUpload(_ sender: PasteraSyncSwitch) {
-        guard ensureDefaultFolderAvailable() else {
+        guard sender.state != .on || ensureDefaultFolderAvailable() else {
             sender.state = .off
             updateControls()
             return
@@ -607,7 +608,7 @@ private extension CPYSyncPreferenceViewController {
     }
 
     @objc func toggleHistoryImport(_ sender: PasteraSyncSwitch) {
-        guard ensureDefaultFolderAvailable() else {
+        guard sender.state != .on || ensureDefaultFolderAvailable() else {
             sender.state = .off
             updateControls()
             return
@@ -617,7 +618,7 @@ private extension CPYSyncPreferenceViewController {
     }
 
     @objc func toggleSnippetUpload(_ sender: PasteraSyncSwitch) {
-        guard ensureDefaultFolderAvailable() else {
+        guard sender.state != .on || ensureDefaultFolderAvailable() else {
             sender.state = .off
             updateControls()
             return
@@ -627,7 +628,7 @@ private extension CPYSyncPreferenceViewController {
     }
 
     @objc func toggleSnippetImport(_ sender: PasteraSyncSwitch) {
-        guard ensureDefaultFolderAvailable() else {
+        guard sender.state != .on || ensureDefaultFolderAvailable() else {
             sender.state = .off
             updateControls()
             return
@@ -637,7 +638,7 @@ private extension CPYSyncPreferenceViewController {
     }
 
     @objc func toggleFileTypeCheckbox(_ sender: NSButton) {
-        guard ensureDefaultFolderAvailable() else {
+        guard sender.state != .on || ensureDefaultFolderAvailable() else {
             sender.state = .off
             updateControls()
             return
@@ -817,6 +818,11 @@ private extension CPYSyncPreferenceViewController {
     }
 
     func updateSyncActivityState() {
+        let vaultSnapshot = passwordVaultSyncSnapshotProvider()
+        if vaultSnapshot.mode == .oneDrive, case .syncing = vaultSnapshot.phase {
+            syncNowButton.isEnabled = false
+            return
+        }
         let status = SyncCoordinator.shared.status
         syncNowButton.isEnabled = status.phase != .syncing
     }
@@ -826,7 +832,7 @@ private extension CPYSyncPreferenceViewController {
             return false
         }
         let settings = settingsStore.settings()
-        guard settings.hasEnabledWork else {
+        guard settings.hasEnabledWork || passwordVaultSyncSnapshotProvider().mode == .oneDrive else {
             return false
         }
         return true

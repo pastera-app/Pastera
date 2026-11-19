@@ -1526,3 +1526,68 @@ private extension Data {
         append(value)
     }
 }
+
+@MainActor
+@Suite
+struct OneDriveLocalDirectoryIntegrationTests {
+    // This probes local OneDrive/FileProvider I/O, not cloud delivery or a second physical device.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["PASTERA_ONEDRIVE_SELFTEST_ROOT"] != nil))
+    func syntheticTwoDeviceSnapshotsAndVaultCASRoundTripInOptedInDirectory() throws {
+        let path = try #require(ProcessInfo.processInfo.environment["PASTERA_ONEDRIVE_SELFTEST_ROOT"])
+        let selectedURL = URL(fileURLWithPath: path, isDirectory: true)
+        try #require(try selectedURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true)
+        let rootURL = selectedURL.appendingPathComponent("Pastera-SelfTest-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+
+        for revision in [1, 2, 2] {
+            for (deviceID, readerID) in [("selftest-a", "selftest-b"), ("selftest-b", "selftest-a")] {
+                let writer = OneDriveFolderSyncProvider(rootURL: rootURL)
+                let reader = OneDriveFolderSyncProvider(rootURL: rootURL)
+                let text = "\(deviceID) synthetic revision \(revision)"
+                let history = PasteboardHistorySyncPayload(
+                    id: "\(deviceID)-history", text: text, updateAt: revision,
+                    deviceID: deviceID, sourceKind: .plainText
+                )
+                let snippets = SnippetSyncSnapshot(
+                    folders: [.init(id: "folder", title: deviceID, index: 0,
+                                    isEnabled: true, updatedAt: revision, deviceID: deviceID)],
+                    snippets: [.init(id: "snippet", folderID: "folder", title: "Synthetic", content: text,
+                                     index: 0, isEnabled: true, updatedAt: revision, deviceID: deviceID)]
+                )
+                let files = FileSyncExportSnapshot(histories: [
+                    .init(deviceID: deviceID, historyID: "\(deviceID)-file", updatedAt: revision, assets: [
+                        .init(assetIndex: 0, pasteboardType: .pdf, data: Data("%PDF \(text)".utf8),
+                              originalFilename: "synthetic.pdf")
+                    ])
+                ], skippedAssetCount: 0)
+                try writer.saveHistorySnapshot([history], deviceID: deviceID, limit: 10,
+                                               maxTextBytes: 1024, snapshotTextBudgetBytes: 4096)
+                try writer.saveSnippetSnapshot(snippets, deviceID: deviceID)
+                try writer.saveFileSnapshot(files, deviceID: deviceID)
+
+                #expect(try reader.loadHistorySnapshots(excludingDeviceID: readerID).flatMap(\.payloads) == [history])
+                #expect(try reader.loadSnippetSnapshots(excludingDeviceID: readerID).map(\.snapshot) == [snippets])
+                let loadedFiles = try #require(try reader.loadFileSnapshots(excludingDeviceID: readerID).first)
+                #expect(loadedFiles.histories == files.histories)
+                #expect(loadedFiles.skippedAssetCount == 0)
+            }
+        }
+
+        let replica = OneDrivePasswordVaultCloudReplica()
+        let signature = Data([0x03, 0xD9, 0xA2, 0x9A, 0x67, 0xFB, 0x4B, 0xB5])
+        let original = signature + Data("synthetic-vault-v1".utf8)
+        let replacement = signature + Data("synthetic-vault-v2".utf8)
+        let firstDigest = try replica.writeAtomically(original, rootURL: rootURL, expecting: .absent)
+        #expect(try OneDrivePasswordVaultCloudReplica().read(rootURL: rootURL)?.data == original)
+        let digest = try replica.writeAtomically(replacement, rootURL: rootURL, expecting: .digest(firstDigest))
+        #expect(throws: PasswordVaultSyncFailure.remoteVerificationFailed) {
+            try replica.writeAtomically(original, rootURL: rootURL, expecting: .digest(firstDigest))
+        }
+        let stored = try #require(try OneDrivePasswordVaultCloudReplica().read(rootURL: rootURL))
+        let expectedDigest = SHA256.hash(data: replacement).map { String(format: "%02x", $0) }.joined()
+        #expect(stored.data == replacement)
+        #expect(stored.digest == expectedDigest)
+        #expect(digest == expectedDigest)
+    }
+}

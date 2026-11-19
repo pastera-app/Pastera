@@ -306,6 +306,10 @@ private extension PasswordVaultSyncService {
     ) throws {
         switch decision {
         case .noChange:
+            var candidate = metadata
+            candidate.lastSyncAt = now()
+            candidate.lastFailure = nil
+            try save(candidate)
             publish(phase: .synced, remoteVaultAvailable: remote != nil)
         case .uploadLocal:
             try upload(local, replacing: remote, rootURL: rootURL)

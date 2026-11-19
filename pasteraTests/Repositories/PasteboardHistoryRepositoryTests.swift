@@ -665,6 +665,39 @@ struct PasteboardHistoryRepositoryTests {
     }
 
     @Test
+    func recapturingEditedTextDoesNotRegressItsSyncVersion() throws {
+        let original = PasteboardContent(assets: [.init(type: .string, data: Data("AAAA".utf8))])
+        let historyID = PasteboardHistory.ID(rawValue: original.hash)
+        repository.save(id: historyID, content: original, updateAt: 10)
+        #expect(repository.updateTextHistory(id: historyID, text: "BBBB", updateAt: 10))
+        let firstEdit = try #require(repository.fetchSyncPayloads(
+            currentDeviceID: CPYUtilities.deviceID, limit: 2000,
+            maxTextBytes: 256 * 1024, snapshotTextBudgetBytes: 8 * 1024 * 1024
+        ).first { $0.id == historyID.rawValue })
+
+        let recaptured = PasteboardContent(assets: [.init(type: .string, data: Data("BBBB".utf8))])
+        #expect(repository.saveCapturedHistory(preferredID: historyID, content: recaptured, updateAt: 10) == historyID)
+        let recapturedHistory = try #require(repository.fetchHistory(id: historyID))
+        #expect(recapturedHistory.updateAt >= firstEdit.updateAt)
+
+        #expect(repository.updateTextHistory(id: historyID, text: "CCCC", updateAt: 10))
+        let secondEdit = try #require(repository.fetchSyncPayloads(
+            currentDeviceID: CPYUtilities.deviceID, limit: 2000,
+            maxTextBytes: 256 * 1024, snapshotTextBudgetBytes: 8 * 1024 * 1024
+        ).first { $0.id == historyID.rawValue })
+        #expect(secondEdit.updateAt > firstEdit.updateAt)
+
+        try withDependencies {
+            try $0.bootstrapDatabase()
+        } operation: {
+            let remoteRepository = PasteboardHistoryRepository()
+            try #require(try remoteRepository.upsertSyncPayload(firstEdit))
+            #expect(try remoteRepository.upsertSyncPayload(secondEdit))
+            #expect(remoteRepository.fetchContent(id: historyID)?.stringValue == "CCCC")
+        }
+    }
+
+    @Test
     func recopyingMatchedHistoryPreservesAnInterleavedRemoteUpdateAndIndexesTheCapturedID() throws {
         let defaults = AppEnvironment.current.defaults
         let previousOverwrite = defaults.object(forKey: Constants.UserDefaults.overwriteSameHistory)
@@ -1835,6 +1868,26 @@ struct PasteboardHistorySyncRepositoryTests {
         )
 
         #expect(payloads.map(\.id) == [newestID.rawValue])
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func observeTextSyncCandidateChangesEmitsForSameSecondHistoryEdit() async throws {
+        let content = PasteboardContent("AAAA")
+        let historyID = PasteboardHistory.ID(rawValue: content.hash)
+        repository.save(id: historyID, content: content, updateAt: 10)
+        var changeCount = 0
+        let cancellable = repository
+            .observeTextSyncCandidateChanges(currentDeviceID: CPYUtilities.deviceID)
+            .sink { changeCount += 1 }
+        defer { _ = cancellable }
+        try await waitUntil { changeCount >= 1 }
+        let initialChangeCount = changeCount
+
+        #expect(repository.updateTextHistory(id: historyID, text: "BBBB", updateAt: 10))
+
+        try await waitUntil { changeCount > initialChangeCount }
+        #expect(changeCount > initialChangeCount, "An edited text must trigger automatic sync even within the same second")
+        #expect(repository.fetchContent(id: historyID)?.stringValue == "BBBB")
     }
 
     @Test(.timeLimit(.minutes(1)))

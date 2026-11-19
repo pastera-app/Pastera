@@ -360,6 +360,62 @@ struct SyncCoordinatorTests {
         #expect(secondModificationDate == firstModificationDate)
     }
 
+    @Test(arguments: [false, true])
+    func coordinatorUploadsSameLengthHistoryEditWithinTheSameSecond(automatic: Bool) async throws {
+        let rootURL = try makeRootURL()
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let provider = OneDriveFolderSyncProvider(rootURL: rootURL)
+        let repository = DependencyBoundSyncHistoryRepository()
+        let coordinatorQueue = DispatchQueue(label: "Pastera.SyncCoordinatorTests.sameSecondEdit")
+        let content = PasteboardContent(assets: [.init(type: .string, data: Data("AAAA".utf8))])
+        let historyID = PasteboardHistory.ID(rawValue: content.hash)
+        repository.save(id: historyID, content: content, updateAt: 10)
+        let coordinator = SyncCoordinator(
+            settingsProvider: { makeSettings(rootURL: rootURL, historyUpload: true) },
+            providerFactory: { _ in provider },
+            historyRepository: repository,
+            snippetRepository: SyncSnippetRepository(),
+            passwordVaultSyncServiceProvider: {
+                CoordinatorPasswordVaultSyncController(snapshot: makeVaultSnapshot(mode: .localOnly))
+            },
+            oneDriveProcessStatusServiceProvider: { CoordinatorOneDriveProcessStatusService() },
+            queue: coordinatorQueue
+        )
+
+        coordinator.start()
+        defer { coordinator.stop() }
+        coordinatorQueue.sync {}
+        let originalPayload = try #require(provider.loadHistorySnapshots(excludingDeviceID: "remote-device")
+            .flatMap(\.payloads).first { $0.id == historyID.rawValue })
+        #expect(originalPayload.text == "AAAA")
+
+        #expect(repository.updateTextHistory(id: historyID, text: "BBBB", updateAt: 10))
+        if !automatic {
+            coordinator.syncNow(reason: .manual, wait: true)
+        }
+
+        let deadline = Date().addingTimeInterval(2)
+        var latestPayload: PasteboardHistorySyncPayload?
+        repeat {
+            latestPayload = try provider.loadHistorySnapshots(excludingDeviceID: "remote-device")
+                .flatMap(\.payloads).first { $0.id == historyID.rawValue }
+            if latestPayload?.text == "BBBB" || !automatic { break }
+            try await Task.sleep(for: .milliseconds(20))
+        } while Date() < deadline
+        let editedPayload = try #require(latestPayload)
+        #expect(editedPayload.text == "BBBB", "A same-second edit must replace the previously exported text")
+        #expect(coordinator.status.uploadedCount == 1)
+
+        try withDependencies {
+            try $0.bootstrapDatabase()
+        } operation: {
+            let remoteRepository = PasteboardHistoryRepository()
+            try #require(try remoteRepository.upsertSyncPayload(originalPayload))
+            #expect(try remoteRepository.upsertSyncPayload(editedPayload), "The remote replica must accept the edited version")
+            #expect(remoteRepository.fetchContent(id: historyID)?.stringValue == "BBBB")
+        }
+    }
+
     @Test
     func coordinatorDoesNotPostStatusChangeForAutomaticHistoryNoOp() throws {
         let rootURL = try makeRootURL()
@@ -2041,6 +2097,9 @@ private final class DependencyBoundSyncHistoryRepository: PasteboardHistoryRepos
     }
     func save(id: PasteboardHistory.ID, content: PasteboardContent, updateAt: Int) {
         dependencies.yield { repository.save(id: id, content: content, updateAt: updateAt) }
+    }
+    func updateTextHistory(id: PasteboardHistory.ID, text: String, updateAt: Int) -> Bool {
+        dependencies.yield { repository.updateTextHistory(id: id, text: text, updateAt: updateAt) }
     }
     func deleteHistory(id: PasteboardHistory.ID) { dependencies.yield { repository.deleteHistory(id: id) } }
     func deleteAll() { dependencies.yield { repository.deleteAll() } }

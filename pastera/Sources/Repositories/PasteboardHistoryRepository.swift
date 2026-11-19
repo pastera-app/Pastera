@@ -610,6 +610,7 @@ final class PasteboardHistoryRepository: PasteboardHistoryRepositoryProtocol {
             try database.write { database in
                 let existingHistory = try PasteboardHistory.find(preferredID).fetchOne(database)
                 var savedID = preferredID
+                var savedUpdateAt = updateAt
                 if let existingHistory {
                     let assets = try PasteboardHistoryAsset
                         .where { $0.pasteboardHistoryID.eq(preferredID) }
@@ -618,10 +619,12 @@ final class PasteboardHistoryRepository: PasteboardHistoryRepositoryProtocol {
                     // A remote import or edit may have changed the match after capture looked it up.
                     if existingHistory.pasteboardTypes != content.types || assets != content.assets {
                         savedID = PasteboardHistory.ID(rawValue: UUID().uuidString)
+                    } else {
+                        savedUpdateAt = max(updateAt, existingHistory.updateAt)
                     }
                 }
                 try saveHistory(
-                    id: savedID, content: content, updateAt: updateAt,
+                    id: savedID, content: content, updateAt: savedUpdateAt,
                     insertingAssets: existingHistory == nil || savedID != preferredID, database: database
                 )
                 return savedID
@@ -683,17 +686,6 @@ final class PasteboardHistoryRepository: PasteboardHistoryRepositoryProtocol {
                 PasteboardContent.Asset(type: .string, data: Data(text.utf8))
             ]
         )
-        let history = PasteboardHistory(
-            id: id,
-            title: content.historyTitle[0...10000],
-            pasteboardTypes: content.types,
-            updateAt: updateAt,
-            deviceID: CPYUtilities.deviceID,
-            containsImage: false,
-            containsFile: false,
-            isTextSyncCandidate: true
-        )
-
         return withErrorReporting {
             try database.write { database in
                 guard let existingHistory = try PasteboardHistory.find(id).fetchOne(database),
@@ -701,6 +693,17 @@ final class PasteboardHistoryRepository: PasteboardHistoryRepositoryProtocol {
                     return false
                 }
 
+                // Second-precision sync timestamps must advance for every edit.
+                let history = PasteboardHistory(
+                    id: id,
+                    title: content.historyTitle[0...10000],
+                    pasteboardTypes: content.types,
+                    updateAt: max(updateAt, existingHistory.updateAt + 1),
+                    deviceID: CPYUtilities.deviceID,
+                    containsImage: false,
+                    containsFile: false,
+                    isTextSyncCandidate: true
+                )
                 try PasteboardHistory.upsert { history }.execute(database)
                 try PasteboardHistoryAsset
                     .delete()

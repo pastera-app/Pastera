@@ -214,6 +214,67 @@ struct PasswordVaultSyncServiceTests {
         #expect(fixture.service.snapshot.phase == .synced)
     }
 
+    @Test("verified unchanged replicas refresh the sync time and clear an old disconnection")
+    func unchangedReplicasRefreshVerifiedSyncMetadata() throws {
+        let local = Data("unchanged-local".utf8)
+        let remote = Data("unchanged-remote".utf8)
+        var metadata = PasswordVaultSyncMetadata.defaultLocalOnly
+        metadata.mode = .oneDrive
+        metadata.localRevision = 7
+        metadata.lastSyncedLocalRevision = 7
+        metadata.lastSyncedLocalDigest = PasswordVaultDigest.hex(local)
+        metadata.lastObservedRemoteDigest = PasswordVaultDigest.hex(remote)
+        metadata.lastSyncAt = Date(timeIntervalSince1970: 1_724_000_000)
+        metadata.lastFailure = .oneDriveNotRunning
+        let fixture = try makeSyncServiceFixture(metadata: metadata, localData: local)
+        fixture.cloud.snapshot = PasswordVaultCloudSnapshot(
+            data: remote,
+            digest: PasswordVaultDigest.hex(remote)
+        )
+
+        fixture.service.synchronize(reason: .manual)
+        fixture.drain()
+
+        let verifiedAt = Date(timeIntervalSince1970: 1_725_000_000)
+        var expectedMetadata = metadata
+        expectedMetadata.lastSyncAt = verifiedAt
+        expectedMetadata.lastFailure = nil
+        #expect(fixture.service.snapshot.phase == .synced)
+        #expect(fixture.service.snapshot.lastSyncAt == verifiedAt)
+        #expect(fixture.metadata.value == expectedMetadata)
+        #expect(fixture.cloud.writes.isEmpty)
+        #expect(fixture.access.mergeCount == 0)
+    }
+
+    @Test("unchanged replica verification does not publish a sync time that failed to persist")
+    func unchangedReplicaMetadataSaveFailurePreservesPreviousSyncState() throws {
+        let local = Data("unchanged-local".utf8)
+        let remote = Data("unchanged-remote".utf8)
+        var metadata = PasswordVaultSyncMetadata.defaultLocalOnly
+        metadata.mode = .oneDrive
+        metadata.localRevision = 7
+        metadata.lastSyncedLocalRevision = 7
+        metadata.lastSyncedLocalDigest = PasswordVaultDigest.hex(local)
+        metadata.lastObservedRemoteDigest = PasswordVaultDigest.hex(remote)
+        metadata.lastSyncAt = Date(timeIntervalSince1970: 1_724_000_000)
+        metadata.lastFailure = .oneDriveNotRunning
+        let fixture = try makeSyncServiceFixture(metadata: metadata, localData: local)
+        fixture.cloud.snapshot = PasswordVaultCloudSnapshot(
+            data: remote,
+            digest: PasswordVaultDigest.hex(remote)
+        )
+        fixture.metadata.saveError = SyncServiceFixtureError.metadataWrite
+
+        fixture.service.synchronize(reason: .manual)
+        fixture.drain()
+
+        #expect(fixture.service.snapshot.phase == .failed(.remoteWriteFailed))
+        #expect(fixture.service.snapshot.lastSyncAt == metadata.lastSyncAt)
+        #expect(fixture.metadata.value == metadata)
+        #expect(fixture.cloud.writes.isEmpty)
+        #expect(fixture.access.mergeCount == 0)
+    }
+
     @Test("repeated sync requests waiting on the vault queue coalesce into one cloud read")
     func queuedSynchronizationsCoalesceIntoSingleRun() throws {
         let local = Data("unchanged-local".utf8)

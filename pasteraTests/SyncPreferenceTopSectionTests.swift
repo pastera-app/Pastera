@@ -454,6 +454,117 @@ struct SyncPreferenceTopSectionTests {
 
 extension SyncPreferenceTopSectionTests {
     @Test
+    func manualSyncStartsWhenOnlyPasswordVaultSyncIsEnabled() throws {
+        let syncService = SyncPreferencePasswordVaultSyncService()
+        AppEnvironment.push(passwordVaultSyncService: syncService)
+        defer { AppEnvironment.popLast() }
+
+        try withPreservedSyncDefaults {
+            let homeURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            let rootURL = cloudStorageURL(homeURL: homeURL)
+                .appendingPathComponent("OneDrive/Pastera/sync", isDirectory: true)
+            try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: homeURL) }
+            AppEnvironment.current.defaults.set(rootURL.path, forKey: Constants.UserDefaults.syncRootPath)
+            let controller = CPYSyncPreferenceViewController(defaultFolderResolutionProvider: { .notFound })
+            controller.loadView()
+            controller.viewDidLoad()
+            let syncButton = try #require(preferenceButtons(in: controller.view).first {
+                $0.title == pasteraPreferenceString("Sync Now")
+            })
+
+            syncButton.performClick(nil)
+            SyncCoordinator.shared.syncNow(reason: .remoteChange, wait: true)
+
+            #expect(syncService.synchronizationReasons == [.manual])
+            #expect(!UserDefaultsSyncSettingsStore().settings().hasEnabledWork)
+        }
+    }
+
+    @Test(arguments: [PasswordVaultSyncPhase.synced, .failed(.remoteUnavailable)])
+    func passwordVaultOnlyManualSyncButtonRecoversAfterSynchronization(terminalPhase: PasswordVaultSyncPhase) throws {
+        let syncService = SyncPreferencePasswordVaultSyncService()
+        AppEnvironment.push(passwordVaultSyncService: syncService)
+        defer { AppEnvironment.popLast() }
+
+        try withPreservedSyncDefaults {
+            let controller = CPYSyncPreferenceViewController(defaultFolderResolutionProvider: { .notFound })
+            controller.loadView()
+            controller.viewDidLoad()
+            let syncButton = try #require(preferenceButtons(in: controller.view).first {
+                $0.title == pasteraPreferenceString("Sync Now")
+            })
+
+            syncService.publish(phase: .syncing(.checking))
+            #expect(!syncButton.isEnabled)
+
+            syncService.publish(phase: terminalPhase)
+            #expect(syncButton.isEnabled)
+        }
+    }
+
+    @Test(arguments: [
+        ("Upload History", Constants.UserDefaults.syncHistoryUploadEnabled),
+        ("Import History", Constants.UserDefaults.syncHistoryImportEnabled),
+        ("Upload Snippets", Constants.UserDefaults.syncSnippetUploadEnabled),
+        ("Import Snippets", Constants.UserDefaults.syncSnippetImportEnabled)
+    ])
+    func enabledSyncScopeCanBeDisabledWhenSavedFolderIsUnavailable(label: String, defaultsKey: String) throws {
+        try withPreservedSyncDefaults {
+            let defaults = AppEnvironment.current.defaults
+            let missingRootURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+                .appendingPathComponent("Library/CloudStorage/OneDrive/Pastera/sync", isDirectory: true)
+            defaults.set(missingRootURL.path, forKey: Constants.UserDefaults.syncRootPath)
+            defaults.set(true, forKey: defaultsKey)
+            let controller = CPYSyncPreferenceViewController(defaultFolderResolutionProvider: { .notFound })
+            controller.loadView()
+            controller.viewDidLoad()
+            let scopeSwitch = try #require(preferenceButtons(in: controller.view).first {
+                $0.accessibilityLabel() == pasteraPreferenceString(label)
+            })
+            #expect(scopeSwitch.state == .on)
+
+            scopeSwitch.performClick(nil)
+
+            #expect(!defaults.bool(forKey: defaultsKey))
+            #expect(scopeSwitch.state == .off)
+        }
+    }
+
+    @Test(arguments: [
+        ("sync-image", [PasteboardAvailableType.tiff]),
+        ("sync-document-assets", [.pdf, .rtf, .rtfd])
+    ])
+    func selectedFileTypesCanBeDisabledWhenSavedFolderIsUnavailable(
+        identifier: String,
+        types: [PasteboardAvailableType]
+    ) throws {
+        try withPreservedSyncDefaults {
+            let defaults = AppEnvironment.current.defaults
+            let missingRootURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+                .appendingPathComponent("Library/CloudStorage/OneDrive/Pastera/sync", isDirectory: true)
+            defaults.set(missingRootURL.path, forKey: Constants.UserDefaults.syncRootPath)
+            let settingsStore = UserDefaultsSyncSettingsStore()
+            types.forEach { settingsStore.setFileTypeEnabled($0, enabled: true) }
+            let controller = CPYSyncPreferenceViewController(defaultFolderResolutionProvider: { .notFound })
+            controller.loadView()
+            controller.viewDidLoad()
+            let fileTypeButton = try #require(preferenceButtons(in: controller.view).first {
+                $0.identifier?.rawValue == identifier
+            })
+            #expect(fileTypeButton.state == .on)
+
+            fileTypeButton.performClick(nil)
+
+            #expect(settingsStore.settings().fileAssetTypes.isDisjoint(with: types))
+            #expect(fileTypeButton.state == .off)
+        }
+    }
+
+    @Test
     func runningOneDriveDistinguishesAnUnavailableFolderFromAStoppedClient() throws {
         let defaults = AppEnvironment.current.defaults
         let homeURL = FileManager.default.temporaryDirectory
@@ -738,8 +849,13 @@ private final class SyncPreferencePasswordVaultSyncService: PasswordVaultSyncCon
         lastSyncAt: nil
     )
     private var observers = [UUID: (PasswordVaultSyncSnapshot) -> Void]()
+    private let synchronizationLock = NSLock()
+    private var recordedSynchronizationReasons = [SyncCoordinator.Reason]()
 
     var observerCount: Int { observers.count }
+    var synchronizationReasons: [SyncCoordinator.Reason] {
+        synchronizationLock.withLock { recordedSynchronizationReasons }
+    }
 
     func addObserver(_ observer: @escaping (PasswordVaultSyncSnapshot) -> Void) -> UUID {
         let identifier = UUID()
@@ -753,7 +869,9 @@ private final class SyncPreferencePasswordVaultSyncService: PasswordVaultSyncCon
     }
 
     func record(_: PasswordVaultCommit) {}
-    func synchronize(reason _: SyncCoordinator.Reason) {}
+    func synchronize(reason: SyncCoordinator.Reason) {
+        synchronizationLock.withLock { recordedSynchronizationReasons.append(reason) }
+    }
 
     func enableOneDrive(
         rootURL _: URL,
